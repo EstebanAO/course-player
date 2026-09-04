@@ -17,6 +17,8 @@ It is designed for personal, offline-first use. Course files, notes, playback hi
 - Supports headings, bold, italic, underline, highlight, strikethrough, links, code, quotes, dividers, bullet lists, numbered lists, and pasted images.
 - Stores application state in `.course-player/progress.json` inside the selected library.
 - Safely imports compatible progress and Markdown notes left by earlier versions, without deleting or modifying the originals.
+- Creates rotating per-session backups for progress and edited notes, and automatically considers those backups during recovery.
+- Refuses to replace a valid playback position when media did not load successfully.
 - Keeps at most three remuxed videos in the local cache.
 - Avoids periodic directory polling and batches progress writes to reduce energy use.
 - Includes library filters, visible lesson states, remembered folder expansion, contextual actions, actionable error banners, and note save feedback.
@@ -47,6 +49,8 @@ It is designed for personal, offline-first use. Course files, notes, playback hi
 
 The resulting application is written to `.build/Course Player.app`. Without FFmpeg, MP4, MOV, M4V, and supported audio files still work.
 
+Run the data-durability regression tests with `./test.sh`.
+
 For `.ts` support, install FFmpeg locally or explicitly provide a redistributable build:
 
 ```sh
@@ -54,6 +58,7 @@ FFMPEG_PATH="$(command -v ffmpeg)" ./build-app.sh
 ```
 
 At runtime, Course Player checks its application resources, `FFMPEG_PATH`, `/opt/homebrew/bin/ffmpeg`, and `/usr/local/bin/ffmpeg` in that order.
+When the user selects an FFmpeg executable, Course Player preserves a private local copy in Application Support so playback does not depend on the original file remaining in place.
 
 To build and copy the application to `/Applications`:
 

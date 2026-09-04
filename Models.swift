@@ -31,6 +31,17 @@ struct ProgressFile: Codable {
     var records: [String: ProgressRecord] = [:]
 }
 
+enum ProgressRecoveryPolicy {
+    static func shouldRecover(_ candidate: ProgressRecord, over current: ProgressRecord?) -> Bool {
+        guard let current else { return true }
+        if current.completionSource == "reset", current.lastOpened >= candidate.lastOpened { return false }
+        let candidateHasStudyData = candidate.completed || candidate.position > 1 || candidate.duration > 1
+        let currentHasStudyData = current.completed || current.position > 1 || current.duration > 1
+        if candidateHasStudyData != currentHasStudyData { return candidateHasStudyData }
+        return candidate.lastOpened > current.lastOpened
+    }
+}
+
 enum LibraryFilter: String, CaseIterable, Identifiable {
     case all, unstarted, inProgress, completed
 

@@ -46,6 +46,8 @@ final class LibraryModel: ObservableObject {
     private var lastProgressSave = Date.distantPast
     private var didStart = false
     private var didRestoreLastVideo = false
+    private var progressBackupCreated = false
+    private var backedUpNotes: Set<String> = []
     private let savedLibraryKey = "CoursePlayerLibraryPath"
     private let savedRateKey = "CoursePlayerPlaybackRate"
     private let savedFFmpegKey = "CoursePlayerFFmpegPath"
@@ -93,6 +95,7 @@ final class LibraryModel: ObservableObject {
         didStart = true
         let savedRate = UserDefaults.standard.float(forKey: savedRateKey)
         if savedRate >= 0.5, savedRate <= 2 { playbackRate = savedRate }
+        preserveConfiguredFFmpeg()
         expandedFolders = Set(UserDefaults.standard.stringArray(forKey: expandedFoldersKey) ?? [])
         installTimeObserver()
         playbackEndObserver = NotificationCenter.default.addObserver(
@@ -150,6 +153,8 @@ final class LibraryModel: ObservableObject {
         rootURL = url
         UserDefaults.standard.set(url.path, forKey: savedLibraryKey)
         selectedItem = nil
+        progressBackupCreated = false
+        backedUpNotes = []
         expandedFolders = []
         UserDefaults.standard.removeObject(forKey: expandedFoldersKey)
         player.replaceCurrentItem(with: nil)
@@ -269,7 +274,8 @@ final class LibraryModel: ObservableObject {
         var record = progress.records[item.relativePath] ?? ProgressRecord()
         record.position = 0
         record.completed = false
-        record.completionSource = nil
+        record.completionSource = "reset"
+        record.lastOpened = .now
         progress.records[item.relativePath] = record
         if selectedItem?.id == item.id {
             currentTime = 0
@@ -313,7 +319,13 @@ final class LibraryModel: ObservableObject {
             issue = AppIssue(title: "FFmpeg no es ejecutable", message: "Elige un archivo FFmpeg ejecutable.", action: .chooseFFmpeg)
             return
         }
-        UserDefaults.standard.set(url.path, forKey: savedFFmpegKey)
+        guard let preserved = preserveFFmpeg(from: url) else {
+            issue = AppIssue(title: "No se pudo conservar FFmpeg",
+                             message: "Comprueba que Course Player tenga acceso a tu carpeta Application Support.",
+                             action: .chooseFFmpeg)
+            return
+        }
+        UserDefaults.standard.set(preserved.path, forKey: savedFFmpegKey)
         if selectedItem?.url.pathExtension.lowercased() == "ts", let selectedItem {
             open(selectedItem, autoplay: false)
         }
@@ -524,6 +536,7 @@ final class LibraryModel: ObservableObject {
 
     private var dataDirectory: URL? { rootURL?.appendingPathComponent(".course-player", isDirectory: true) }
     private var progressURL: URL? { dataDirectory?.appendingPathComponent("progress.json") }
+    private var progressBackupDirectory: URL? { dataDirectory?.appendingPathComponent("backups", isDirectory: true) }
 
     private func loadProgress() {
         progress = ProgressFile()
@@ -537,11 +550,11 @@ final class LibraryModel: ObservableObject {
         }
 
         var recovered = false
-        for url in compatibleLegacyProgressURLs() {
+        for url in compatibleRecoveryProgressURLs() {
             guard let data = try? Data(contentsOf: url),
                   let legacy = try? decoder.decode(ProgressFile.self, from: data) else { continue }
             for (path, candidate) in legacy.records {
-                if shouldRecover(candidate, over: progress.records[path]) {
+                if ProgressRecoveryPolicy.shouldRecover(candidate, over: progress.records[path]) {
                     progress.records[path] = candidate
                     recovered = true
                 }
@@ -550,26 +563,25 @@ final class LibraryModel: ObservableObject {
         if recovered { saveProgressNow() }
     }
 
-    private func compatibleLegacyProgressURLs() -> [URL] {
+    private func compatibleRecoveryProgressURLs() -> [URL] {
         guard let rootURL,
               let children = try? FileManager.default.contentsOfDirectory(
                 at: rootURL, includingPropertiesForKeys: [.isDirectoryKey], options: []
               ) else { return [] }
-        return children.compactMap { directory in
+        var urls: [URL] = children.compactMap { directory -> URL? in
             guard directory.lastPathComponent.hasPrefix("."),
                   directory.lastPathComponent != ".course-player",
                   (try? directory.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return nil }
             let candidate = directory.appendingPathComponent("progress.json")
             return FileManager.default.fileExists(atPath: candidate.path) ? candidate : nil
         }
-    }
-
-    private func shouldRecover(_ candidate: ProgressRecord, over current: ProgressRecord?) -> Bool {
-        guard let current else { return true }
-        let candidateHasStudyData = candidate.completed || candidate.position > 1 || candidate.duration > 1
-        let currentHasStudyData = current.completed || current.position > 1 || current.duration > 1
-        if candidateHasStudyData != currentHasStudyData { return candidateHasStudyData }
-        return candidate.lastOpened > current.lastOpened
+        if let progressBackupDirectory,
+           let backups = try? FileManager.default.contentsOfDirectory(
+                at: progressBackupDirectory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
+           ) {
+            urls.append(contentsOf: backups.filter { $0.pathExtension.lowercased() == "json" })
+        }
+        return urls
     }
 
     private func scheduleProgressSave() {
@@ -585,6 +597,7 @@ final class LibraryModel: ObservableObject {
         guard let directory = dataDirectory, let url = progressURL else { return }
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try createProgressBackupIfNeeded(of: url)
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             encoder.dateEncodingStrategy = .iso8601
@@ -596,6 +609,24 @@ final class LibraryModel: ObservableObject {
                              message: "Comprueba que la carpeta de la biblioteca permite escritura.",
                              action: .revealLibrary)
         }
+    }
+
+    private func createProgressBackupIfNeeded(of current: URL) throws {
+        guard !progressBackupCreated else { return }
+        progressBackupCreated = true
+        guard FileManager.default.fileExists(atPath: current.path), let progressBackupDirectory else { return }
+        try FileManager.default.createDirectory(at: progressBackupDirectory, withIntermediateDirectories: true)
+        let destination = progressBackupDirectory.appendingPathComponent("progress-\(backupTimestamp()).json")
+        try FileManager.default.copyItem(at: current, to: destination)
+        let backups = (try? FileManager.default.contentsOfDirectory(
+            at: progressBackupDirectory, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]
+        )) ?? []
+        let sorted = backups.filter { $0.pathExtension.lowercased() == "json" }.sorted {
+            let first = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            let second = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            return first > second
+        }
+        for old in sorted.dropFirst(12) { try? FileManager.default.removeItem(at: old) }
     }
 
     private func saveProgressCheckpointIfNeeded() {
@@ -629,12 +660,42 @@ final class LibraryModel: ObservableObject {
 
     private func loadNote(for item: LibraryItem) {
         guard let url = noteURL(for: item) else { noteText = ""; return }
+        recoverNoteBackupIfNeeded(for: item, destination: url)
         recoverLegacyNoteIfNeeded(for: item, destination: url)
         if let existing = try? String(contentsOf: url, encoding: .utf8) {
             noteText = existing
         } else {
             let escapedPath = item.relativePath.replacingOccurrences(of: "\"", with: "\\\"")
             noteText = "---\nvideo: \"\(escapedPath)\"\ncurso: \"\(item.relativePath.split(separator: "/").first ?? "")\"\n---\n\n# \(item.name)\n\n## Ideas principales\n\n- \n\n## Reflexiones\n\n"
+        }
+    }
+
+    private func recoverNoteBackupIfNeeded(for item: LibraryItem, destination: URL) {
+        let manager = FileManager.default
+        let existingSize = (try? destination.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        guard existingSize == 0, let backupDirectory = noteBackupDirectory(for: item),
+              !manager.fileExists(atPath: backupDirectory.appendingPathComponent(".intentionally-empty").path),
+              let candidates = try? manager.contentsOfDirectory(
+                at: backupDirectory, includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
+                options: [.skipsHiddenFiles]
+              ) else { return }
+        let latest = candidates.filter {
+            $0.pathExtension.lowercased() == "md"
+                && ((try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) > 0
+        }.max {
+            let first = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            let second = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            return first < second
+        }
+        guard let latest else { return }
+        do {
+            try manager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if manager.fileExists(atPath: destination.path) { try manager.removeItem(at: destination) }
+            try manager.copyItem(at: latest, to: destination)
+        } catch {
+            issue = AppIssue(title: "No se pudo restaurar la nota",
+                             message: "Existe una copia de seguridad, pero no pudo copiarse a la carpeta de notas.",
+                             action: .revealLibrary)
         }
     }
 
@@ -711,7 +772,9 @@ final class LibraryModel: ObservableObject {
         guard let item = selectedItem, let url = noteURL(for: item) else { return false }
         do {
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try createNoteBackupIfNeeded(for: item, current: url)
             try noteText.write(to: url, atomically: true, encoding: .utf8)
+            updateIntentionalEmptyMarker(for: item)
             noteSaveState = .saved
             return true
         } catch {
@@ -723,11 +786,61 @@ final class LibraryModel: ObservableObject {
         }
     }
 
+    private func noteBackupDirectory(for item: LibraryItem) -> URL? {
+        guard let dataDirectory else { return nil }
+        let path = URL(fileURLWithPath: item.relativePath)
+        let relativeFolder = path.deletingLastPathComponent().path
+        let noteName = path.deletingPathExtension().lastPathComponent
+        return dataDirectory.appendingPathComponent("note-backups", isDirectory: true)
+            .appendingPathComponent(relativeFolder, isDirectory: true)
+            .appendingPathComponent(noteName, isDirectory: true)
+    }
+
+    private func createNoteBackupIfNeeded(for item: LibraryItem, current: URL) throws {
+        guard !backedUpNotes.contains(item.relativePath) else { return }
+        backedUpNotes.insert(item.relativePath)
+        guard FileManager.default.fileExists(atPath: current.path),
+              let backupDirectory = noteBackupDirectory(for: item) else { return }
+        try FileManager.default.createDirectory(at: backupDirectory, withIntermediateDirectories: true)
+        let destination = backupDirectory.appendingPathComponent("note-\(backupTimestamp()).md")
+        try FileManager.default.copyItem(at: current, to: destination)
+        let backups = (try? FileManager.default.contentsOfDirectory(
+            at: backupDirectory, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]
+        )) ?? []
+        let sorted = backups.filter { $0.pathExtension.lowercased() == "md" }.sorted {
+            let first = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            let second = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            return first > second
+        }
+        for old in sorted.dropFirst(12) { try? FileManager.default.removeItem(at: old) }
+    }
+
+    private func updateIntentionalEmptyMarker(for item: LibraryItem) {
+        guard let backupDirectory = noteBackupDirectory(for: item) else { return }
+        let marker = backupDirectory.appendingPathComponent(".intentionally-empty")
+        if noteText.isEmpty {
+            try? FileManager.default.createDirectory(at: backupDirectory, withIntermediateDirectories: true)
+            if !FileManager.default.fileExists(atPath: marker.path) {
+                FileManager.default.createFile(atPath: marker.path, contents: Data())
+            }
+        } else {
+            try? FileManager.default.removeItem(at: marker)
+        }
+    }
+
+    private func backupTimestamp() -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyyMMdd-HHmmss-SSS"
+        return formatter.string(from: .now)
+    }
+
     private func storeCurrentPosition() {
-        guard let item = selectedItem else { return }
+        guard let item = selectedItem, player.currentItem != nil,
+              currentTime.isFinite, currentTime >= 0 else { return }
         var record = progress.records[item.relativePath] ?? ProgressRecord()
         record.position = currentTime
-        record.duration = duration
+        if duration.isFinite, duration > 0 { record.duration = duration }
         record.lastOpened = .now
         progress.records[item.relativePath] = record
         saveProgressNow()
@@ -886,12 +999,54 @@ final class LibraryModel: ObservableObject {
         let manager = FileManager.default
         let candidates: [URL?] = [
             Bundle.main.url(forResource: "ffmpeg", withExtension: nil),
+            preservedFFmpegURL,
             ProcessInfo.processInfo.environment["FFMPEG_PATH"].map { URL(fileURLWithPath: $0) },
             UserDefaults.standard.string(forKey: savedFFmpegKey).map { URL(fileURLWithPath: $0) },
             URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg"),
             URL(fileURLWithPath: "/usr/local/bin/ffmpeg")
         ]
         return candidates.compactMap { $0 }.first { manager.isExecutableFile(atPath: $0.path) }
+    }
+
+    private var preservedFFmpegURL: URL? {
+        guard let support = try? FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true
+        ) else { return nil }
+        return support.appendingPathComponent("Course Player", isDirectory: true)
+            .appendingPathComponent("Tools", isDirectory: true)
+            .appendingPathComponent("ffmpeg")
+    }
+
+    private func preserveConfiguredFFmpeg() {
+        guard let savedPath = UserDefaults.standard.string(forKey: savedFFmpegKey) else { return }
+        let source = URL(fileURLWithPath: savedPath)
+        if let preserved = preserveFFmpeg(from: source) {
+            UserDefaults.standard.set(preserved.path, forKey: savedFFmpegKey)
+        }
+    }
+
+    private func preserveFFmpeg(from source: URL) -> URL? {
+        let manager = FileManager.default
+        guard manager.isExecutableFile(atPath: source.path), let destination = preservedFFmpegURL else { return nil }
+        if source.standardizedFileURL == destination.standardizedFileURL { return destination }
+        if manager.isExecutableFile(atPath: destination.path) { return destination }
+        let directory = destination.deletingLastPathComponent()
+        let temporary = directory.appendingPathComponent("ffmpeg.partial")
+        do {
+            try manager.createDirectory(at: directory, withIntermediateDirectories: true)
+            try? manager.removeItem(at: temporary)
+            try manager.copyItem(at: source, to: temporary)
+            try manager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: temporary.path)
+            if manager.fileExists(atPath: destination.path) {
+                _ = try manager.replaceItemAt(destination, withItemAt: temporary)
+            } else {
+                try manager.moveItem(at: temporary, to: destination)
+            }
+            return destination
+        } catch {
+            try? manager.removeItem(at: temporary)
+            return nil
+        }
     }
 
     private func pruneVideoCache(at root: URL, keeping current: URL) {
@@ -917,6 +1072,7 @@ final class LibraryModel: ObservableObject {
                 var record = self.progress.records[item.relativePath] ?? ProgressRecord()
                 record.position = self.currentTime
                 record.duration = self.duration
+                if record.completionSource == "reset", self.currentTime > 1 { record.completionSource = nil }
                 self.progress.records[item.relativePath] = record
                 self.saveProgressCheckpointIfNeeded()
             }

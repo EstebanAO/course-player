@@ -9,6 +9,8 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+      - name: Test data durability
+        run: ./test.sh
       - name: Build universal app
         run: COURSE_PLAYER_ARCHS="arm64 x86_64" ./build-app.sh
       - name: Package app
@@ -17,4 +19,3 @@ jobs:
         with:
           name: Course-Player-macOS
           path: .build/Course-Player.zip
-
