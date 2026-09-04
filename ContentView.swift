@@ -53,6 +53,7 @@ private struct IssueBanner: View {
 
     private var actionTitle: String {
         switch issue.action {
+        case .findFFmpeg: return "Configurar automáticamente"
         case .chooseFFmpeg: return "Elegir FFmpeg"
         case .retryVideo: return "Reintentar"
         case .revealLibrary: return "Mostrar carpeta"

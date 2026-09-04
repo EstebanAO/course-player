@@ -78,6 +78,17 @@ private struct CoursePlayerSettingsView: View {
                         .disabled(library.rootURL == nil)
                 }
             }
+            Section("Videos .ts") {
+                LabeledContent("FFmpeg") {
+                    Label(library.isFFmpegReady ? "Listo" : "No configurado",
+                          systemImage: library.isFFmpegReady ? "checkmark.circle.fill" : "exclamationmark.circle")
+                        .foregroundStyle(library.isFFmpegReady ? Color.green : Color.orange)
+                }
+                HStack {
+                    Button("Buscar automáticamente") { library.configureFFmpegAutomatically() }
+                    Button("Elegir archivo…") { library.chooseFFmpeg() }
+                }
+            }
             Section {
                 Text("Las notas y el progreso se guardan dentro de la biblioteca. Course Player no envía datos a internet.")
                     .font(.caption).foregroundStyle(.secondary)

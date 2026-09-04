@@ -96,6 +96,7 @@ final class LibraryModel: ObservableObject {
         let savedRate = UserDefaults.standard.float(forKey: savedRateKey)
         if savedRate >= 0.5, savedRate <= 2 { playbackRate = savedRate }
         preserveConfiguredFFmpeg()
+        if !isFFmpegReady { _ = adoptAutomaticallyAvailableFFmpeg() }
         expandedFolders = Set(UserDefaults.standard.stringArray(forKey: expandedFoldersKey) ?? [])
         installTimeObserver()
         playbackEndObserver = NotificationCenter.default.addObserver(
@@ -302,6 +303,7 @@ final class LibraryModel: ObservableObject {
         switch action {
         case .retryVideo:
             if let selectedItem { open(selectedItem, autoplay: false) }
+        case .findFFmpeg: configureFFmpegAutomatically()
         case .chooseFFmpeg: chooseFFmpeg()
         case .revealLibrary:
             if let rootURL { NSWorkspace.shared.activateFileViewerSelecting([rootURL]) }
@@ -328,6 +330,23 @@ final class LibraryModel: ObservableObject {
         UserDefaults.standard.set(preserved.path, forKey: savedFFmpegKey)
         if selectedItem?.url.pathExtension.lowercased() == "ts", let selectedItem {
             open(selectedItem, autoplay: false)
+        }
+    }
+
+    var isFFmpegReady: Bool { ffmpegExecutableURL() != nil }
+
+    func configureFFmpegAutomatically() {
+        if adoptAutomaticallyAvailableFFmpeg() {
+            issue = nil
+            statusMessage = "FFmpeg quedó configurado automáticamente"
+            if selectedItem?.url.pathExtension.lowercased() == "ts", let selectedItem,
+               player.currentItem == nil {
+                open(selectedItem, autoplay: false)
+            }
+        } else {
+            issue = AppIssue(title: "FFmpeg no se encontró automáticamente",
+                             message: "Puedes instalar FFmpeg con Homebrew o elegir manualmente su ejecutable.",
+                             action: .chooseFFmpeg)
         }
     }
 
@@ -903,8 +922,8 @@ final class LibraryModel: ObservableObject {
               let ffmpeg = ffmpegExecutableURL() else {
             statusMessage = "FFmpeg es necesario para este archivo .ts"
             issue = AppIssue(title: "No se puede abrir este video .ts",
-                             message: "Selecciona una instalación de FFmpeg para preparar el video.",
-                             action: .chooseFFmpeg)
+                             message: "Course Player puede buscar y configurar FFmpeg por ti.",
+                             action: .findFFmpeg)
             return
         }
         let cacheRoot = dataDirectory.appendingPathComponent("video-cache", isDirectory: true)
@@ -991,7 +1010,7 @@ final class LibraryModel: ObservableObject {
             isPreparingVideo = false
             statusMessage = "No se pudo iniciar el componente de video"
             issue = AppIssue(title: "No se pudo iniciar FFmpeg", message: error.localizedDescription,
-                             action: .chooseFFmpeg)
+                             action: .findFFmpeg)
         }
     }
 
@@ -1022,6 +1041,40 @@ final class LibraryModel: ObservableObject {
         let source = URL(fileURLWithPath: savedPath)
         if let preserved = preserveFFmpeg(from: source) {
             UserDefaults.standard.set(preserved.path, forKey: savedFFmpegKey)
+        }
+    }
+
+    @discardableResult private func adoptAutomaticallyAvailableFFmpeg() -> Bool {
+        if let existing = ffmpegExecutableURL() {
+            if let preserved = preserveFFmpeg(from: existing) {
+                UserDefaults.standard.set(preserved.path, forKey: savedFFmpegKey)
+            }
+            return true
+        }
+        for candidate in installedApplicationFFmpegCandidates()
+            where FileManager.default.isExecutableFile(atPath: candidate.path) {
+            guard let preserved = preserveFFmpeg(from: candidate) else { continue }
+            UserDefaults.standard.set(preserved.path, forKey: savedFFmpegKey)
+            return true
+        }
+        return false
+    }
+
+    private func installedApplicationFFmpegCandidates() -> [URL] {
+        let roots = [
+            URL(fileURLWithPath: "/Applications", isDirectory: true),
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications", isDirectory: true)
+        ]
+        return roots.flatMap { root in
+            let applications = (try? FileManager.default.contentsOfDirectory(
+                at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]
+            )) ?? []
+            return applications.filter { $0.pathExtension.lowercased() == "app" }.flatMap { application in
+                [
+                    application.appendingPathComponent("Contents/Resources/ffmpeg"),
+                    application.appendingPathComponent("Contents/MacOS/ffmpeg")
+                ]
+            }
         }
     }
 

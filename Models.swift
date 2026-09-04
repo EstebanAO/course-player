@@ -70,7 +70,7 @@ enum NoteSaveState: Equatable {
 }
 
 struct AppIssue: Identifiable, Equatable {
-    enum Action: Equatable { case retryVideo, chooseFFmpeg, revealLibrary }
+    enum Action: Equatable { case retryVideo, findFFmpeg, chooseFFmpeg, revealLibrary }
     let id = UUID()
     let title: String
     let message: String

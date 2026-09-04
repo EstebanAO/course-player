@@ -59,6 +59,7 @@ FFMPEG_PATH="$(command -v ffmpeg)" ./build-app.sh
 
 At runtime, Course Player checks its application resources, `FFMPEG_PATH`, `/opt/homebrew/bin/ffmpeg`, and `/usr/local/bin/ffmpeg` in that order.
 When the user selects an FFmpeg executable, Course Player preserves a private local copy in Application Support so playback does not depend on the original file remaining in place.
+Course Player also configures FFmpeg automatically when it finds a compatible copy in its private storage, Homebrew, or another installed macOS application. Manual file selection remains available as an advanced fallback.
 
 To build and copy the application to `/Applications`:
 
