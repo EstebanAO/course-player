@@ -17,14 +17,20 @@ final class LibraryModel: ObservableObject {
     @Published var items: [LibraryItem] = []
     @Published var selectedItem: LibraryItem?
     @Published var searchText = ""
+    @Published var libraryFilter: LibraryFilter = .all
     @Published var noteText = ""
+    @Published var noteSaveState: NoteSaveState = .idle
     @Published var isPlaying = false
     @Published var currentTime: Double = 0
     @Published var duration: Double = 0
     @Published var playbackRate: Float = 1
     @Published var isScanning = false
     @Published var isPreparingVideo = false
+    @Published var preparationProgress: Double?
     @Published var statusMessage = ""
+    @Published var issue: AppIssue?
+    @Published var restoredSession = false
+    @Published var expandedFolders: Set<String> = []
 
     let player = AVPlayer()
     private var progress = ProgressFile()
@@ -33,24 +39,34 @@ final class LibraryModel: ObservableObject {
     private var saveTask: Task<Void, Never>?
     private var scanTask: Task<Void, Never>?
     private var conversionProcess: Process?
+    private var conversionProgressTimer: DispatchSourceTimer?
+    private var conversionWasCancelled = false
+    private var playbackEndObserver: NSObjectProtocol?
     private var libraryEventStream: FSEventStreamRef?
     private var lastProgressSave = Date.distantPast
     private var didStart = false
     private var didRestoreLastVideo = false
     private let savedLibraryKey = "CoursePlayerLibraryPath"
+    private let savedRateKey = "CoursePlayerPlaybackRate"
+    private let savedFFmpegKey = "CoursePlayerFFmpegPath"
+    private let expandedFoldersKey = "CoursePlayerExpandedFolders"
 
     private let videoExtensions: Set<String> = ["ts", "mp4", "mov", "m4v"]
     private let audioExtensions: Set<String> = ["mp3", "m4a", "aac", "wav", "aiff"]
     private let documentExtensions: Set<String> = ["pdf", "doc", "docx", "txt", "md", "epub"]
     private let ignoredNames: Set<String> = ["Course Player Notes", "Course Player.app"]
 
-    var filteredItems: [LibraryItem] {
+    var displayedItems: [LibraryItem] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return items }
-        return flatten(items).filter {
-            $0.kind != .folder && $0.name.localizedCaseInsensitiveContains(query)
-                || $0.relativePath.localizedCaseInsensitiveContains(query)
+        if !query.isEmpty {
+            return flatten(items).filter {
+                $0.kind != .folder
+                    && matchesFilter($0)
+                    && ($0.name.localizedCaseInsensitiveContains(query)
+                        || $0.relativePath.localizedCaseInsensitiveContains(query))
+            }
         }
+        return filteredTree(items)
     }
 
     var selectedProgress: ProgressRecord {
@@ -62,11 +78,28 @@ final class LibraryModel: ObservableObject {
     var completedVideos: Int {
         flatten(items).filter { $0.kind == .video && isCompleted($0) }.count
     }
+    var inProgressVideos: Int { videos.filter { !isCompleted($0) && progressFraction(for: $0) > 0 }.count }
+    var pendingVideos: Int { max(0, totalVideos - completedVideos - inProgressVideos) }
+    var videos: [LibraryItem] { flatten(items).filter { $0.kind == .video } }
+    var nextItem: LibraryItem? { adjacentItem(offset: 1) }
+    var previousItem: LibraryItem? { adjacentItem(offset: -1) }
+    var autoPlayNext: Bool {
+        get { UserDefaults.standard.bool(forKey: "CoursePlayerAutoPlayNext") }
+        set { UserDefaults.standard.set(newValue, forKey: "CoursePlayerAutoPlayNext"); objectWillChange.send() }
+    }
 
     func start() {
         guard !didStart else { return }
         didStart = true
+        let savedRate = UserDefaults.standard.float(forKey: savedRateKey)
+        if savedRate >= 0.5, savedRate <= 2 { playbackRate = savedRate }
+        expandedFolders = Set(UserDefaults.standard.stringArray(forKey: expandedFoldersKey) ?? [])
         installTimeObserver()
+        playbackEndObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.playbackDidEnd() }
+        }
 
         if let savedPath = UserDefaults.standard.string(forKey: savedLibraryKey) {
             let savedURL = URL(fileURLWithPath: savedPath, isDirectory: true)
@@ -91,6 +124,8 @@ final class LibraryModel: ObservableObject {
             FSEventStreamStop(stream)
             FSEventStreamInvalidate(stream)
         }
+        if let playbackEndObserver { NotificationCenter.default.removeObserver(playbackEndObserver) }
+        conversionProgressTimer?.cancel()
     }
 
     func chooseLibrary() {
@@ -101,18 +136,33 @@ final class LibraryModel: ObservableObject {
         panel.allowsMultipleSelection = false
         panel.directoryURL = rootURL
         if panel.runModal() == .OK, let url = panel.url {
-            saveCurrentNoteNow()
-            stopWatchingLibrary()
-            rootURL = url
-            UserDefaults.standard.set(url.path, forKey: savedLibraryKey)
-            selectedItem = nil
-            player.replaceCurrentItem(with: nil)
-            didRestoreLastVideo = false
-            loadProgress()
-            scan()
-            startWatchingLibrary()
-            restoreLastVideo()
+            openLibrary(url)
         }
+    }
+
+    func openLibrary(_ url: URL) {
+        guard looksLikeLibrary(url) else {
+            issue = AppIssue(title: "No es una carpeta válida", message: "Arrastra o selecciona una carpeta de cursos.", action: nil)
+            return
+        }
+        saveCurrentNoteNow()
+        stopWatchingLibrary()
+        rootURL = url
+        UserDefaults.standard.set(url.path, forKey: savedLibraryKey)
+        selectedItem = nil
+        expandedFolders = []
+        UserDefaults.standard.removeObject(forKey: expandedFoldersKey)
+        player.replaceCurrentItem(with: nil)
+        didRestoreLastVideo = false
+        loadProgress()
+        scan()
+        startWatchingLibrary()
+        restoreLastVideo()
+    }
+
+    func setFolder(_ id: String, expanded: Bool) {
+        if expanded { expandedFolders.insert(id) } else { expandedFolders.remove(id) }
+        UserDefaults.standard.set(Array(expandedFolders), forKey: expandedFoldersKey)
     }
 
     func scan(silently: Bool = false) {
@@ -127,6 +177,7 @@ final class LibraryModel: ObservableObject {
     }
 
     func select(_ item: LibraryItem) {
+        restoredSession = false
         open(item, autoplay: true)
     }
 
@@ -142,6 +193,8 @@ final class LibraryModel: ObservableObject {
         conversionProcess?.terminate()
         conversionProcess = nil
         isPreparingVideo = false
+        preparationProgress = nil
+        issue = nil
         selectedItem = item
         loadNote(for: item)
         let record = progress.records[item.relativePath] ?? ProgressRecord()
@@ -177,27 +230,102 @@ final class LibraryModel: ObservableObject {
 
     func setRate(_ rate: Float) {
         playbackRate = rate
+        UserDefaults.standard.set(rate, forKey: savedRateKey)
         if isPlaying { player.rate = rate }
+    }
+
+    func playPrevious() {
+        guard let previousItem else { return }
+        open(previousItem, autoplay: true)
+    }
+
+    func playNext() {
+        guard let nextItem else { return }
+        open(nextItem, autoplay: true)
     }
 
     func toggleCompleted() {
         guard let item = selectedItem else { return }
         var record = progress.records[item.relativePath] ?? ProgressRecord()
         record.completed.toggle()
-        if record.completed, duration > 0 { record.position = duration }
+        record.completionSource = record.completed ? "manual" : nil
         progress.records[item.relativePath] = record
         objectWillChange.send()
         scheduleProgressSave()
     }
 
+    func toggleCompleted(_ item: LibraryItem) {
+        var record = progress.records[item.relativePath] ?? ProgressRecord()
+        record.completed.toggle()
+        record.completionSource = record.completed ? "manual" : nil
+        progress.records[item.relativePath] = record
+        objectWillChange.send()
+        scheduleProgressSave()
+    }
+
+    func resetProgress(_ item: LibraryItem) {
+        var record = progress.records[item.relativePath] ?? ProgressRecord()
+        record.position = 0
+        record.completed = false
+        record.completionSource = nil
+        progress.records[item.relativePath] = record
+        if selectedItem?.id == item.id {
+            currentTime = 0
+            player.seek(to: .zero)
+        }
+        objectWillChange.send()
+        saveProgressNow()
+    }
+
     func setNoteText(_ text: String) {
         noteText = text
+        noteSaveState = .saving
         noteSaveTask?.cancel()
         noteSaveTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(500))
             guard !Task.isCancelled else { return }
             self?.saveCurrentNoteNow()
         }
+    }
+
+    func retryLastIssue() {
+        guard let action = issue?.action else { issue = nil; return }
+        issue = nil
+        switch action {
+        case .retryVideo:
+            if let selectedItem { open(selectedItem, autoplay: false) }
+        case .chooseFFmpeg: chooseFFmpeg()
+        case .revealLibrary:
+            if let rootURL { NSWorkspace.shared.activateFileViewerSelecting([rootURL]) }
+        }
+    }
+
+    func chooseFFmpeg() {
+        let panel = NSOpenPanel()
+        panel.title = "Elige el ejecutable de FFmpeg"
+        panel.prompt = "Usar FFmpeg"
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard FileManager.default.isExecutableFile(atPath: url.path) else {
+            issue = AppIssue(title: "FFmpeg no es ejecutable", message: "Elige un archivo FFmpeg ejecutable.", action: .chooseFFmpeg)
+            return
+        }
+        UserDefaults.standard.set(url.path, forKey: savedFFmpegKey)
+        if selectedItem?.url.pathExtension.lowercased() == "ts", let selectedItem {
+            open(selectedItem, autoplay: false)
+        }
+    }
+
+    func cancelVideoPreparation() {
+        conversionWasCancelled = true
+        conversionProgressTimer?.cancel()
+        conversionProgressTimer = nil
+        conversionProcess?.terminate()
+        conversionProcess = nil
+        isPreparingVideo = false
+        preparationProgress = nil
+        statusMessage = "Preparación cancelada"
     }
 
     func revealNote() {
@@ -282,6 +410,10 @@ final class LibraryModel: ObservableObject {
         saveProgressNow()
     }
 
+    func revealLibrary() {
+        if let rootURL { NSWorkspace.shared.activateFileViewerSelecting([rootURL]) }
+    }
+
     func progressForCourse(_ item: LibraryItem) -> Double {
         let videos = flatten(item.children ?? []).filter { $0.kind == .video }
         guard !videos.isEmpty else { return 0 }
@@ -293,9 +425,23 @@ final class LibraryModel: ObservableObject {
         progress.records[item.relativePath]?.completed == true
     }
 
+    func completionDescription(for item: LibraryItem) -> String {
+        guard let record = progress.records[item.relativePath], record.completed else { return "" }
+        switch record.completionSource {
+        case "watched": return "Completado al terminar el video"
+        case "manual": return "Marcado como completado manualmente"
+        default: return "Completado"
+        }
+    }
+
     func progressFraction(for item: LibraryItem) -> Double {
         guard let record = progress.records[item.relativePath], record.duration > 0 else { return 0 }
         return min(1, max(0, record.position / record.duration))
+    }
+
+    func completedCount(for item: LibraryItem) -> (completed: Int, total: Int) {
+        let courseVideos = flatten(item.children ?? []).filter { $0.kind == .video }
+        return (courseVideos.filter(isCompleted).count, courseVideos.count)
     }
 
     func displayTime(_ seconds: Double) -> String {
@@ -340,6 +486,34 @@ final class LibraryModel: ObservableObject {
         source.flatMap { [$0] + flatten($0.children ?? []) }
     }
 
+    private func matchesFilter(_ item: LibraryItem) -> Bool {
+        guard item.kind == .video else { return libraryFilter == .all }
+        switch libraryFilter {
+        case .all: return true
+        case .unstarted: return !isCompleted(item) && progressFraction(for: item) == 0
+        case .inProgress: return !isCompleted(item) && progressFraction(for: item) > 0
+        case .completed: return isCompleted(item)
+        }
+    }
+
+    private func filteredTree(_ source: [LibraryItem]) -> [LibraryItem] {
+        source.compactMap { item in
+            if item.kind == .folder {
+                let children = filteredTree(item.children ?? [])
+                return children.isEmpty ? nil : LibraryItem(id: item.id, name: item.name, url: item.url,
+                                                             relativePath: item.relativePath, kind: item.kind,
+                                                             children: children)
+            }
+            return matchesFilter(item) ? item : nil
+        }
+    }
+
+    private func adjacentItem(offset: Int) -> LibraryItem? {
+        guard let selectedItem, let index = videos.firstIndex(where: { $0.id == selectedItem.id }) else { return nil }
+        let target = index + offset
+        return videos.indices.contains(target) ? videos[target] : nil
+    }
+
     private func relativePath(for url: URL, root: URL) -> String {
         String(url.path.dropFirst(root.path.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
@@ -368,13 +542,18 @@ final class LibraryModel: ObservableObject {
 
     private func saveProgressNow() {
         guard let directory = dataDirectory, let url = progressURL else { return }
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        encoder.dateEncodingStrategy = .iso8601
-        if let data = try? encoder.encode(progress) {
-            try? data.write(to: url, options: .atomic)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            encoder.dateEncodingStrategy = .iso8601
+            let data = try encoder.encode(progress)
+            try data.write(to: url, options: .atomic)
             lastProgressSave = .now
+        } catch {
+            issue = AppIssue(title: "No se pudo guardar el progreso",
+                             message: "Comprueba que la carpeta de la biblioteca permite escritura.",
+                             action: .revealLibrary)
         }
     }
 
@@ -417,10 +596,20 @@ final class LibraryModel: ObservableObject {
         }
     }
 
-    private func saveCurrentNoteNow() {
-        guard let item = selectedItem, let url = noteURL(for: item) else { return }
-        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? noteText.write(to: url, atomically: true, encoding: .utf8)
+    @discardableResult private func saveCurrentNoteNow() -> Bool {
+        guard let item = selectedItem, let url = noteURL(for: item) else { return false }
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try noteText.write(to: url, atomically: true, encoding: .utf8)
+            noteSaveState = .saved
+            return true
+        } catch {
+            noteSaveState = .failed
+            issue = AppIssue(title: "No se pudo guardar la nota",
+                             message: "Comprueba que la biblioteca sigue disponible y permite escritura.",
+                             action: .revealLibrary)
+            return false
+        }
     }
 
     private func storeCurrentPosition() {
@@ -429,7 +618,6 @@ final class LibraryModel: ObservableObject {
         record.position = currentTime
         record.duration = duration
         record.lastOpened = .now
-        if duration > 0, currentTime / duration >= 0.9 { record.completed = true }
         progress.records[item.relativePath] = record
         saveProgressNow()
     }
@@ -444,6 +632,27 @@ final class LibraryModel: ObservableObject {
             return first < second
         }), progress.records[last.relativePath] != nil else { return }
         open(last, autoplay: false)
+        restoredSession = true
+    }
+
+    private func playbackDidEnd() {
+        guard let item = selectedItem else { return }
+        var record = progress.records[item.relativePath] ?? ProgressRecord()
+        record.position = duration
+        record.duration = duration
+        record.completed = true
+        record.completionSource = "watched"
+        progress.records[item.relativePath] = record
+        isPlaying = false
+        saveProgressNow()
+        objectWillChange.send()
+        if autoPlayNext, let nextItem {
+            open(nextItem, autoplay: true)
+        } else if nextItem != nil {
+            statusMessage = "Lección completada · Siguiente disponible"
+        } else {
+            statusMessage = "Lección completada"
+        }
     }
 
     private func play(_ url: URL, for item: LibraryItem, autoplay: Bool) {
@@ -461,13 +670,17 @@ final class LibraryModel: ObservableObject {
             isPlaying = false
         }
         isPreparingVideo = false
+        preparationProgress = nil
         statusMessage = "Listo"
     }
 
     private func prepareTransportStream(_ item: LibraryItem, autoplay: Bool) {
         guard let dataDirectory,
               let ffmpeg = ffmpegExecutableURL() else {
-            statusMessage = "Instala FFmpeg o define FFMPEG_PATH para reproducir archivos .ts"
+            statusMessage = "FFmpeg es necesario para este archivo .ts"
+            issue = AppIssue(title: "No se puede abrir este video .ts",
+                             message: "Selecciona una instalación de FFmpeg para preparar el video.",
+                             action: .chooseFFmpeg)
             return
         }
         let cacheRoot = dataDirectory.appendingPathComponent("video-cache", isDirectory: true)
@@ -480,6 +693,8 @@ final class LibraryModel: ObservableObject {
         }
 
         isPreparingVideo = true
+        preparationProgress = 0
+        conversionWasCancelled = false
         isPlaying = false
         player.replaceCurrentItem(with: nil)
         statusMessage = "Preparando video por primera vez…"
@@ -499,7 +714,14 @@ final class LibraryModel: ObservableObject {
             let errorText = String(data: errorData, encoding: .utf8) ?? ""
             Task { @MainActor in
                 guard let self, self.selectedItem?.id == item.id else { return }
+                self.conversionProgressTimer?.cancel()
+                self.conversionProgressTimer = nil
                 self.conversionProcess = nil
+                if self.conversionWasCancelled {
+                    self.conversionWasCancelled = false
+                    try? FileManager.default.removeItem(at: partial)
+                    return
+                }
                 if finished.terminationStatus == 0 {
                     try? FileManager.default.removeItem(at: output)
                     do {
@@ -509,19 +731,43 @@ final class LibraryModel: ObservableObject {
                     } catch {
                         self.isPreparingVideo = false
                         self.statusMessage = "No se pudo guardar el video preparado"
+                        self.issue = AppIssue(title: "No se pudo guardar el video",
+                                             message: "Comprueba el espacio disponible y los permisos de la biblioteca.",
+                                             action: .retryVideo)
                     }
                 } else {
                     self.isPreparingVideo = false
                     self.statusMessage = errorText.isEmpty ? "No se pudo preparar este video" : "No se pudo preparar este video"
+                    self.issue = AppIssue(title: "No se pudo preparar el video",
+                                         message: errorText.isEmpty ? "FFmpeg terminó con un error desconocido." : errorText,
+                                         action: .retryVideo)
                 }
             }
         }
         conversionProcess = process
-        do { try process.run() }
+        do {
+            try process.run()
+            let sourceBytes = (try? item.url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
+            if sourceBytes > 0 {
+                let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+                timer.schedule(deadline: .now() + 0.4, repeating: 0.5)
+                timer.setEventHandler { [weak self] in
+                    let outputBytes = (try? partial.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
+                    Task { @MainActor in
+                        guard let self, self.isPreparingVideo else { return }
+                        self.preparationProgress = min(0.99, Double(outputBytes) / Double(sourceBytes))
+                    }
+                }
+                conversionProgressTimer = timer
+                timer.resume()
+            }
+        }
         catch {
             conversionProcess = nil
             isPreparingVideo = false
             statusMessage = "No se pudo iniciar el componente de video"
+            issue = AppIssue(title: "No se pudo iniciar FFmpeg", message: error.localizedDescription,
+                             action: .chooseFFmpeg)
         }
     }
 
@@ -530,6 +776,7 @@ final class LibraryModel: ObservableObject {
         let candidates: [URL?] = [
             Bundle.main.url(forResource: "ffmpeg", withExtension: nil),
             ProcessInfo.processInfo.environment["FFMPEG_PATH"].map { URL(fileURLWithPath: $0) },
+            UserDefaults.standard.string(forKey: savedFFmpegKey).map { URL(fileURLWithPath: $0) },
             URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg"),
             URL(fileURLWithPath: "/usr/local/bin/ffmpeg")
         ]
@@ -559,7 +806,6 @@ final class LibraryModel: ObservableObject {
                 var record = self.progress.records[item.relativePath] ?? ProgressRecord()
                 record.position = self.currentTime
                 record.duration = self.duration
-                if self.duration > 0, self.currentTime / self.duration >= 0.9 { record.completed = true }
                 self.progress.records[item.relativePath] = record
                 self.saveProgressCheckpointIfNeeded()
             }

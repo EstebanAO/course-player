@@ -24,12 +24,66 @@ struct CoursePlayerApp: App {
             }
             CommandMenu("Reproducción") {
                 Button("Reproducir / Pausar") { library.togglePlayback() }
-                    .keyboardShortcut(.space, modifiers: [])
+                    .keyboardShortcut("p", modifiers: [.command, .option])
+                Button("Video anterior") { library.playPrevious() }
+                    .keyboardShortcut(.leftArrow, modifiers: [.command, .option])
+                    .disabled(library.previousItem == nil)
+                Button("Siguiente video") { library.playNext() }
+                    .keyboardShortcut(.rightArrow, modifiers: [.command, .option])
+                    .disabled(library.nextItem == nil)
                 Button("Retroceder 15 segundos") { library.skip(seconds: -15) }
                     .keyboardShortcut("j", modifiers: [.command, .option])
                 Button("Adelantar 15 segundos") { library.skip(seconds: 15) }
                     .keyboardShortcut("l", modifiers: [.command, .option])
+                Divider()
+                Toggle("Reproducir siguiente automáticamente", isOn: Binding(
+                    get: { library.autoPlayNext }, set: { library.autoPlayNext = $0 }
+                ))
             }
         }
+
+        Settings {
+            CoursePlayerSettingsView()
+                .environmentObject(library)
+                .frame(width: 460)
+        }
+    }
+}
+
+private struct CoursePlayerSettingsView: View {
+    @EnvironmentObject private var library: LibraryModel
+    @AppStorage("CoursePlayerAutoPlayNext") private var autoPlayNext = false
+
+    var body: some View {
+        Form {
+            Section("Reproducción") {
+                Toggle("Reproducir el siguiente video automáticamente", isOn: $autoPlayNext)
+                Picker("Velocidad preferida", selection: Binding(
+                    get: { Double(library.playbackRate) },
+                    set: { library.setRate(Float($0)) }
+                )) {
+                    ForEach([0.5, 0.75, 1, 1.25, 1.5, 1.75, 2], id: \.self) { rate in
+                        Text("\(rate.formatted())×").tag(rate)
+                    }
+                }
+            }
+            Section("Biblioteca") {
+                LabeledContent("Carpeta") {
+                    Text(library.rootURL?.lastPathComponent ?? "Sin elegir")
+                        .foregroundStyle(.secondary).lineLimit(1)
+                }
+                HStack {
+                    Button("Elegir otra…") { library.chooseLibrary() }
+                    Button("Mostrar en Finder") { library.revealLibrary() }
+                        .disabled(library.rootURL == nil)
+                }
+            }
+            Section {
+                Text("Las notas y el progreso se guardan dentro de la biblioteca. Course Player no envía datos a internet.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .padding(.vertical, 12)
     }
 }

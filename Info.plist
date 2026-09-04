@@ -9,9 +9,15 @@
     <key>CFBundleIdentifier</key>
     <string>app.courseplayer.mac</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>2</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>0.2.0</string>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>es</string>
+    <key>CFBundleLocalizations</key>
+    <array>
+        <string>es</string>
+    </array>
     <key>CFBundleExecutable</key>
     <string>CoursePlayer</string>
     <key>CFBundleIconFile</key>

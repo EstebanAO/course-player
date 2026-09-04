@@ -9,13 +9,28 @@ It is designed for personal, offline-first use. Course files, notes, playback hi
 - Recursively indexes folders and subfolders and updates when macOS reports file changes.
 - Plays MP4, MOV, M4V, common audio formats, and MPEG transport streams (`.ts`) through FFmpeg remuxing.
 - Remembers the last opened lesson, playback position, completion state, and playback speed.
+- Opens the last lesson paused with a clear **Continue studying** action.
 - Supports playback rates from 0.5× to 2×.
+- Provides previous/next controls and optional automatic playback of the next lesson.
 - Provides a resizable split view with the player and a live-preview Markdown editor.
 - Saves one standard `.md` file per lesson in `Course Player Notes/`.
 - Supports headings, bold, italic, underline, highlight, strikethrough, links, code, quotes, dividers, bullet lists, numbered lists, and pasted images.
 - Stores application state in `.course-player/progress.json` inside the selected library.
 - Keeps at most three remuxed videos in the local cache.
 - Avoids periodic directory polling and batches progress writes to reduce energy use.
+- Includes library filters, visible lesson states, remembered folder expansion, contextual actions, actionable error banners, and note save feedback.
+- Supports image paste and drag-and-drop, task lists, links, and familiar formatting shortcuts.
+- Keeps user-facing language consistent in Spanish and includes a localization catalog structure for future translations.
+
+## Keyboard shortcuts
+
+- `Command-B`, `Command-I`, `Command-U`: bold, italic, underline in notes.
+- `Command-Shift-7`, `Command-Shift-8`: numbered and bulleted lists.
+- `Command-Shift-H`: highlight selected text.
+- `Command-Option-P`: play or pause without taking the space bar away from the editor.
+- `Command-Option-Left/Right`: previous or next video.
+- `Command-Option-J/L`: back or forward 15 seconds.
+- Standard macOS text navigation, selection, undo, paste, and find shortcuts remain available.
 
 ## Requirements
 
@@ -46,6 +61,16 @@ To build and copy the application to `/Applications`:
 ```
 
 You may also pass `FFMPEG_PATH` to `install-app.sh`.
+
+## Release build
+
+Create a universal Apple Silicon + Intel `.dmg` and `.zip`:
+
+```sh
+./release.sh
+```
+
+For signed distribution, set `SIGNING_IDENTITY` to a Developer ID Application identity. If a notarytool keychain profile is available, also set `NOTARY_PROFILE`; the release script will submit and staple the build. GitHub Actions builds an unsigned universal artifact for every push and pull request.
 
 ## FFmpeg notice
 

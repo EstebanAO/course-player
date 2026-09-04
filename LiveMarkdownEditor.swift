@@ -4,7 +4,7 @@ import AppKit
 enum MarkdownFormatStyle: String {
     case heading1, heading2, heading3, body
     case bold, italic, underline, highlight, strikethrough
-    case bulletList, numberedList, divider
+    case bulletList, numberedList, taskList, link, divider
 }
 
 struct MarkdownFormatCommand: Equatable {
@@ -17,6 +17,7 @@ struct LiveMarkdownEditor: NSViewRepresentable {
     let baseURL: URL?
     let onPasteImage: (NSImage) -> String?
     let formatCommand: MarkdownFormatCommand?
+    let onSelectionFormatsChanged: (Set<MarkdownFormatStyle>) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -35,6 +36,8 @@ struct LiveMarkdownEditor: NSViewRepresentable {
         editor.isRichText = true
         editor.importsGraphics = false
         editor.allowsUndo = true
+        editor.usesFindPanel = true
+        editor.isIncrementalSearchingEnabled = true
         editor.isAutomaticQuoteSubstitutionEnabled = false
         editor.isAutomaticDashSubstitutionEnabled = false
         editor.isAutomaticLinkDetectionEnabled = false
@@ -44,6 +47,7 @@ struct LiveMarkdownEditor: NSViewRepresentable {
         editor.isVerticallyResizable = true
         editor.isHorizontallyResizable = false
         editor.autoresizingMask = [.width]
+        editor.registerForDraggedTypes([.fileURL, .png, .tiff])
         scroll.documentView = editor
 
         context.coordinator.editor = editor
@@ -88,6 +92,8 @@ struct LiveMarkdownEditor: NSViewRepresentable {
 
         func textViewDidChangeSelection(_ notification: Notification) {
             guard !isRendering, let editor, editor.window?.firstResponder === editor else { return }
+            let formats = (editor as? MarkdownTextView)?.currentFormats() ?? []
+            Task { @MainActor [weak self] in self?.parent.onSelectionFormatsChanged(formats) }
             guard editor.selectedRange().length == 0 else { return }
             let storage = editor.textStorage ?? NSTextStorage()
             let source = markdownSource(from: storage)
@@ -181,6 +187,8 @@ struct LiveMarkdownEditor: NSViewRepresentable {
                     text.addAttributes([.foregroundColor: NSColor.secondaryLabelColor,
                                         .font: NSFont.systemFont(ofSize: 16).italic], range: visibleRange)
                     text.addAttribute(.foregroundColor, value: NSColor.systemOrange, range: NSRange(location: lineRange.location, length: min(2, visibleLength)))
+                } else if let match = firstMatch(#"^(\s*)[-*+]\s+(\[[ xX]\])(\s+)"#, in: line) {
+                    styleTaskList(in: text, lineRange: visibleRange, match: match)
                 } else if let match = firstMatch(#"^(\s*)([-*+])(\s+)"#, in: line) {
                     styleBulletList(in: text, lineRange: visibleRange, match: match)
                 } else if let match = firstMatch(#"^(\s*)(\d+[.)])(\s+)"#, in: line) {
@@ -235,6 +243,23 @@ struct LiveMarkdownEditor: NSViewRepresentable {
                                 .foregroundColor: NSColor.systemOrange], range: globalMarker)
             text.addAttributes([.font: NSFont.systemFont(ofSize: 16), .kern: 0], range: globalWhitespace)
             text.addAttribute(.paragraphStyle, value: listParagraphStyle(indent: CGFloat(match.range(at: 1).length) * 8),
+                              range: lineRange)
+        }
+
+        private func styleTaskList(in text: NSMutableAttributedString, lineRange: NSRange,
+                                   match: NSTextCheckingResult) {
+            let checkbox = match.range(at: 2)
+            let whitespace = match.range(at: 3)
+            let globalCheckbox = NSRange(location: lineRange.location + checkbox.location, length: checkbox.length)
+            let globalWhitespace = NSRange(location: lineRange.location + whitespace.location, length: whitespace.length)
+            let checked = (text.string as NSString).substring(with: globalCheckbox).lowercased() == "[x]"
+            text.addAttributes([
+                .font: NSFont.monospacedSystemFont(ofSize: 15, weight: .semibold),
+                .foregroundColor: checked ? NSColor.systemGreen : NSColor.systemOrange
+            ], range: globalCheckbox)
+            text.addAttributes([.font: NSFont.systemFont(ofSize: 16), .kern: 0], range: globalWhitespace)
+            text.addAttribute(.paragraphStyle,
+                              value: listParagraphStyle(indent: CGFloat(match.range(at: 1).length) * 8),
                               range: lineRange)
         }
 
@@ -425,6 +450,70 @@ private final class MarkdownTextView: NSTextView {
         super.paste(sender)
     }
 
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if modifiers == [.command] {
+            switch event.charactersIgnoringModifiers?.lowercased() {
+            case "b": applyFormat(.bold); return true
+            case "i": applyFormat(.italic); return true
+            case "u": applyFormat(.underline); return true
+            default: break
+            }
+        }
+        if modifiers == [.command, .shift] {
+            switch event.charactersIgnoringModifiers?.lowercased() {
+            case "7": applyFormat(.numberedList); return true
+            case "8": applyFormat(.bulletList); return true
+            case "h": applyFormat(.highlight); return true
+            default: break
+            }
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    func currentFormats() -> Set<MarkdownFormatStyle> {
+        guard let storage = textStorage, storage.length > 0 else { return [] }
+        let selection = selectedRange()
+        let location = min(selection.location, storage.length - 1)
+        var formats: Set<MarkdownFormatStyle> = []
+        let attributes = storage.attributes(at: location, effectiveRange: nil)
+        if let font = attributes[.font] as? NSFont {
+            let traits = NSFontManager.shared.traits(of: font)
+            if traits.contains(.boldFontMask) { formats.insert(.bold) }
+            if traits.contains(.italicFontMask) { formats.insert(.italic) }
+        }
+        if (attributes[.underlineStyle] as? Int ?? 0) != 0 { formats.insert(.underline) }
+        if (attributes[.strikethroughStyle] as? Int ?? 0) != 0 { formats.insert(.strikethrough) }
+        if attributes[.backgroundColor] != nil { formats.insert(.highlight) }
+
+        let ns = string as NSString
+        let line = ns.substring(with: ns.lineRange(for: NSRange(location: location, length: 0)))
+        if line.range(of: #"^\s*[-*+]\s+\[[ xX]\]\s+"#, options: .regularExpression) != nil {
+            formats.insert(.taskList)
+        } else if line.range(of: #"^\s*[-*+]\s+"#, options: .regularExpression) != nil {
+            formats.insert(.bulletList)
+        } else if line.range(of: #"^\s*\d+[.)]\s+"#, options: .regularExpression) != nil {
+            formats.insert(.numberedList)
+        }
+        return formats
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        imageFromCopiedFile(in: sender.draggingPasteboard) != nil ? .copy : super.draggingEntered(sender)
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard let image = NSImage(pasteboard: sender.draggingPasteboard)
+                ?? imageFromCopiedFile(in: sender.draggingPasteboard),
+              let markdown = imagePasteHandler?(image) else {
+            return super.performDragOperation(sender)
+        }
+        let point = convert(sender.draggingLocation, from: nil)
+        setSelectedRange(NSRange(location: characterIndexForInsertion(at: point), length: 0))
+        insertText(markdown, replacementRange: selectedRange())
+        return true
+    }
+
     override func insertNewline(_ sender: Any?) {
         let selection = selectedRange()
         guard selection.length == 0 else { super.insertNewline(sender); return }
@@ -433,6 +522,13 @@ private final class MarkdownTextView: NSTextView {
         let prefixLength = max(0, selection.location - lineRange.location)
         let beforeCursor = source.substring(with: NSRange(location: lineRange.location, length: prefixLength))
 
+        if let match = firstLineMatch(#"^(\s*)[-*+]\s+\[[ xX]\]\s+(.*)$"#, in: beforeCursor) {
+            let indentation = (beforeCursor as NSString).substring(with: match.range(at: 1))
+            let body = (beforeCursor as NSString).substring(with: match.range(at: 2))
+            continueList(indentation: indentation, marker: "- [ ]", body: body, lineRange: lineRange,
+                         beforeCursorLength: prefixLength)
+            return
+        }
         if let match = firstLineMatch(#"^(\s*)([-*+])\s+(.*)$"#, in: beforeCursor) {
             let indentation = (beforeCursor as NSString).substring(with: match.range(at: 1))
             let marker = (beforeCursor as NSString).substring(with: match.range(at: 2))
@@ -486,6 +582,8 @@ private final class MarkdownTextView: NSTextView {
         formatMenu.addItem(.separator())
         formatMenu.addItem(item("Lista con viñetas", #selector(formatBulletList)))
         formatMenu.addItem(item("Lista numerada", #selector(formatNumberedList)))
+        formatMenu.addItem(item("Lista de tareas", #selector(formatTaskList)))
+        formatMenu.addItem(item("Enlace", #selector(formatLink)))
         formatMenu.addItem(item("Línea divisora", #selector(insertDivider)))
         formatItem.submenu = formatMenu
         menu.insertItem(formatItem, at: 0)
@@ -506,6 +604,8 @@ private final class MarkdownTextView: NSTextView {
         case .strikethrough: toggleInline(opening: "~~", closing: "~~")
         case .bulletList: applyList(numbered: false)
         case .numberedList: applyList(numbered: true)
+        case .taskList: applyTaskList()
+        case .link: insertLink()
         case .divider: insertDivider(nil)
         }
         window?.makeFirstResponder(self)
@@ -620,6 +720,43 @@ private final class MarkdownTextView: NSTextView {
         setSelectedRange(NSRange(location: lineRange.location, length: (replacement as NSString).length))
     }
 
+    private func applyTaskList() {
+        let source = string as NSString
+        let selection = selectedRange()
+        let lookupRange = selection.length > 0
+            ? NSRange(location: selection.location, length: max(0, selection.length - 1))
+            : selection
+        let lineRange = source.lineRange(for: lookupRange)
+        let original = source.substring(with: lineRange)
+        let endsWithNewline = original.hasSuffix("\n")
+        var lines = original.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        if endsWithNewline, lines.last == "" { lines.removeLast() }
+        let pattern = #"^\s*[-*+]\s+\[[ xX]\]\s+"#
+        let contentLines = lines.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        let shouldRemove = !contentLines.isEmpty && contentLines.allSatisfy {
+            $0.range(of: pattern, options: .regularExpression) != nil
+        }
+        lines = lines.map { line in
+            guard !line.trimmingCharacters(in: .whitespaces).isEmpty else { return line }
+            let indentation = String(line.prefix { $0 == " " || $0 == "\t" })
+            let body = line.replacingOccurrences(of: #"^\s*(?:(?:[-*+]\s+\[[ xX]\])|[-*+]|\d+[.)])\s+"#,
+                                                 with: "", options: .regularExpression)
+            return shouldRemove ? indentation + body : indentation + "- [ ] " + body
+        }
+        let replacement = lines.joined(separator: "\n") + (endsWithNewline ? "\n" : "")
+        insertText(replacement, replacementRange: lineRange)
+        setSelectedRange(NSRange(location: lineRange.location, length: (replacement as NSString).length))
+    }
+
+    private func insertLink() {
+        let selection = selectedRange()
+        let label = selection.length > 0 ? (string as NSString).substring(with: selection) : "texto"
+        let replacement = "[\(label)](https://)"
+        insertText(replacement, replacementRange: selection)
+        let urlOffset = ("[\(label)](" as NSString).length
+        setSelectedRange(NSRange(location: selection.location + urlOffset, length: 8))
+    }
+
     @objc private func formatHeading1() { applyFormat(.heading1) }
     @objc private func formatHeading2() { applyFormat(.heading2) }
     @objc private func formatHeading3() { applyFormat(.heading3) }
@@ -631,6 +768,8 @@ private final class MarkdownTextView: NSTextView {
     @objc private func formatStrikethrough() { applyFormat(.strikethrough) }
     @objc private func formatBulletList() { applyFormat(.bulletList) }
     @objc private func formatNumberedList() { applyFormat(.numberedList) }
+    @objc private func formatTaskList() { applyFormat(.taskList) }
+    @objc private func formatLink() { applyFormat(.link) }
 
     @objc private func insertDivider(_ sender: Any?) {
         let selection = selectedRange()

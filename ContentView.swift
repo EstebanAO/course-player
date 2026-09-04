@@ -1,26 +1,63 @@
 import SwiftUI
 import AVKit
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @EnvironmentObject private var library: LibraryModel
 
     var body: some View {
-        NavigationSplitView {
-            LibrarySidebar()
-                .navigationSplitViewColumnWidth(min: 245, ideal: 300, max: 420)
-        } detail: {
-            if library.selectedItem == nil {
-                WelcomeView()
-            } else {
-                HSplitView {
-                    PlayerPane()
-                        .frame(minWidth: 430)
-                    NotesPane()
-                        .frame(minWidth: 330)
+        VStack(spacing: 0) {
+            if let issue = library.issue { IssueBanner(issue: issue) }
+            NavigationSplitView {
+                LibrarySidebar()
+                    .navigationSplitViewColumnWidth(min: 245, ideal: 310, max: 440)
+            } detail: {
+                if library.selectedItem == nil {
+                    WelcomeView()
+                } else {
+                    HSplitView {
+                        PlayerPane().frame(minWidth: 430)
+                        NotesPane().frame(minWidth: 330)
+                    }
                 }
             }
         }
         .navigationTitle("Course Player")
+        .dropDestination(for: URL.self) { urls, _ in
+            guard let folder = urls.first else { return false }
+            library.openLibrary(folder)
+            return true
+        }
+    }
+}
+
+private struct IssueBanner: View {
+    @EnvironmentObject private var library: LibraryModel
+    let issue: AppIssue
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(issue.title).font(.subheadline.bold())
+                Text(issue.message).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+            }
+            Spacer()
+            if issue.action != nil { Button(actionTitle) { library.retryLastIssue() } }
+            Button { library.issue = nil } label: { Image(systemName: "xmark") }
+                .buttonStyle(.plain).help("Cerrar")
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .background(Color.orange.opacity(0.12))
+    }
+
+    private var actionTitle: String {
+        switch issue.action {
+        case .chooseFFmpeg: return "Elegir FFmpeg"
+        case .retryVideo: return "Reintentar"
+        case .revealLibrary: return "Mostrar carpeta"
+        case nil: return ""
+        }
     }
 }
 
@@ -49,17 +86,50 @@ private struct LibrarySidebar: View {
 
             Divider()
 
+            if let item = library.selectedItem, library.restoredSession {
+                Button { library.togglePlayback(); library.restoredSession = false } label: {
+                    HStack(spacing: 9) {
+                        Image(systemName: "play.circle.fill").font(.title2)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Continuar estudiando").font(.caption.bold())
+                            Text(item.name).lineLimit(1)
+                            Text("Desde \(library.displayTime(library.currentTime))")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                    }
+                    .padding(10)
+                }
+                .buttonStyle(.plain)
+                Divider()
+            }
+
+            Picker("Filtrar", selection: $library.libraryFilter) {
+                ForEach(LibraryFilter.allCases) { filter in Text(filter.title).tag(filter) }
+            }
+            .labelsHidden().pickerStyle(.menu).padding(.horizontal, 10).padding(.vertical, 6)
+
             if library.searchText.isEmpty {
-                List {
-                    ForEach(library.items) { item in LibraryRow(item: item) }
+                if library.displayedItems.isEmpty {
+                    SidebarEmptyState(title: "No hay elementos", icon: "line.3.horizontal.decrease.circle",
+                                      detail: "Prueba otro filtro o actualiza la biblioteca.")
+                } else {
+                    List {
+                        ForEach(library.displayedItems) { item in LibraryRow(item: item) }
+                    }
+                    .listStyle(.sidebar)
                 }
-                .listStyle(.sidebar)
             } else {
-                List(library.filteredItems) { item in
-                    Button { library.select(item) } label: { LeafLabel(item: item) }
-                        .buttonStyle(.plain)
+                if library.displayedItems.isEmpty {
+                    SidebarEmptyState(title: "Sin resultados", icon: "magnifyingglass",
+                                      detail: "No se encontró “\(library.searchText)”.")
+                } else {
+                    List(library.displayedItems) { item in
+                        Button { library.select(item) } label: { LeafLabel(item: item) }
+                            .buttonStyle(.plain)
+                    }
+                    .listStyle(.sidebar)
                 }
-                .listStyle(.sidebar)
             }
         }
         .searchable(text: $library.searchText, prompt: "Buscar curso o video")
@@ -72,13 +142,33 @@ private struct LibrarySidebar: View {
     }
 }
 
+private struct SidebarEmptyState: View {
+    let title: String
+    let icon: String
+    let detail: String
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Spacer()
+            Image(systemName: icon).font(.title).foregroundStyle(.secondary)
+            Text(title).font(.headline)
+            Text(detail).font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            Spacer()
+        }
+        .padding(20)
+    }
+}
+
 private struct LibraryRow: View {
     @EnvironmentObject private var library: LibraryModel
     let item: LibraryItem
 
     var body: some View {
         if item.kind == .folder {
-            DisclosureGroup {
+            DisclosureGroup(isExpanded: Binding(
+                get: { library.expandedFolders.contains(item.id) },
+                set: { library.setFolder(item.id, expanded: $0) }
+            )) {
                 ForEach(item.children ?? []) { child in LibraryRow(item: child) }
             } label: {
                 HStack(spacing: 7) {
@@ -86,13 +176,21 @@ private struct LibraryRow: View {
                     Text(item.name).lineLimit(2)
                     Spacer(minLength: 4)
                     let value = library.progressForCourse(item)
-                    if value > 0 { Text("\(Int(value * 100))%").font(.caption2).foregroundStyle(.secondary) }
+                    let count = library.completedCount(for: item)
+                    if value > 0 || count.total > 0 {
+                        Text("\(count.completed)/\(count.total)").font(.caption2).foregroundStyle(.secondary)
+                    }
                 }
             }
         } else {
             Button { library.select(item) } label: { LeafLabel(item: item) }
                 .buttonStyle(.plain)
                 .contextMenu {
+                    Button(library.isCompleted(item) ? "Marcar como pendiente" : "Marcar como completado") {
+                        library.toggleCompleted(item)
+                    }
+                    Button("Reiniciar progreso") { library.resetProgress(item) }
+                    Divider()
                     Button("Abrir archivo original") { NSWorkspace.shared.open(item.url) }
                 }
         }
@@ -106,9 +204,9 @@ private struct LeafLabel: View {
     var body: some View {
         HStack(spacing: 7) {
             if item.kind == .video {
-                Circle()
-                    .fill(statusColor)
-                    .frame(width: 8, height: 8)
+                Image(systemName: statusIcon)
+                    .foregroundStyle(statusColor)
+                    .frame(width: 14)
                     .help(statusHelp)
             }
             Image(systemName: icon)
@@ -132,8 +230,13 @@ private struct LeafLabel: View {
         if fraction > 0 { return .orange }
         return .secondary.opacity(0.35)
     }
+    private var statusIcon: String {
+        if isDone { return "checkmark.circle.fill" }
+        if fraction > 0 { return "circle.lefthalf.filled" }
+        return "circle"
+    }
     private var statusHelp: String {
-        if isDone { return "Completado" }
+        if isDone { return library.completionDescription(for: item) }
         if fraction > 0 { return "En progreso: \(Int(fraction * 100))%" }
         return "Sin comenzar"
     }
@@ -162,8 +265,27 @@ private struct WelcomeView: View {
                 Label("Progreso automático", systemImage: "checkmark.circle")
             }.foregroundStyle(.secondary)
             Button("Elegir otra carpeta…") { library.chooseLibrary() }
+                .buttonStyle(.borderedProminent)
+            Text("También puedes arrastrar aquí una carpeta de cursos.")
+                .font(.caption).foregroundStyle(.secondary)
+            HStack(alignment: .top, spacing: 26) {
+                welcomeStep("1", "Elige una carpeta", "La aplicación encuentra cursos y lecciones automáticamente.")
+                welcomeStep("2", "Estudia y anota", "El video y las notas Markdown viven en la misma ventana.")
+                welcomeStep("3", "Continúa después", "Se recuerda el video, el minuto y tu velocidad.")
+            }
+            .frame(maxWidth: 720)
         }
         .padding(40)
+    }
+
+    private func welcomeStep(_ number: String, _ title: String, _ detail: String) -> some View {
+        VStack(spacing: 7) {
+            Text(number).font(.headline).frame(width: 30, height: 30)
+                .background(.orange.opacity(0.18), in: Circle())
+            Text(title).font(.subheadline.bold())
+            Text(detail).font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
     }
 }
 
@@ -213,6 +335,8 @@ private struct PlayerPane: View {
                         Text("Preparando el video…").font(.headline).foregroundStyle(.white)
                         Text("Solo ocurre la primera vez que abres este archivo.")
                             .font(.caption).foregroundStyle(.white.opacity(0.75))
+                        if let progress = library.preparationProgress { ProgressView(value: progress).frame(width: 220) }
+                        Button("Cancelar") { library.cancelVideoPreparation() }
                     }
                     .padding(24).background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 14))
                 }
@@ -243,11 +367,15 @@ private struct PlayerPane: View {
                 }
 
                 HStack(spacing: 14) {
+                    Button { library.playPrevious() } label: { Image(systemName: "backward.end") }
+                        .buttonStyle(.plain).disabled(library.previousItem == nil).help("Video anterior")
                     Button { library.skip(seconds: -15) } label: { Image(systemName: "gobackward.15") }.buttonStyle(.plain)
                     Button { library.togglePlayback() } label: {
                         Image(systemName: library.isPlaying ? "pause.circle.fill" : "play.circle.fill").font(.system(size: 34))
                     }.buttonStyle(.plain)
                     Button { library.skip(seconds: 15) } label: { Image(systemName: "goforward.15") }.buttonStyle(.plain)
+                    Button { library.playNext() } label: { Image(systemName: "forward.end") }
+                        .buttonStyle(.plain).disabled(library.nextItem == nil).help("Siguiente video")
                     Spacer()
                     Menu {
                         ForEach(rates, id: \.self) { rate in
@@ -258,6 +386,10 @@ private struct PlayerPane: View {
                         }
                     } label: { Text("\(library.playbackRate.formatted())×").monospacedDigit().frame(minWidth: 42) }
                     .menuStyle(.borderlessButton)
+                    Toggle(isOn: Binding(get: { library.autoPlayNext }, set: { library.autoPlayNext = $0 })) {
+                        Image(systemName: "forward.end.circle")
+                    }
+                    .toggleStyle(.button).buttonStyle(.plain).help("Reproducir siguiente automáticamente")
                     Button { library.openSelectedExternally() } label: { Image(systemName: "arrow.up.forward.app") }
                         .buttonStyle(.plain).help("Abrir archivo original")
                 }
@@ -274,11 +406,18 @@ private struct PlayerPane: View {
 private struct NotesPane: View {
     @EnvironmentObject private var library: LibraryModel
     @State private var formatCommand: MarkdownFormatCommand?
+    @State private var activeFormats: Set<MarkdownFormatStyle> = []
 
     var body: some View {
         VStack(spacing: 0) {
             HStack {
                 Label("Notas del video", systemImage: "square.and.pencil").font(.headline)
+                if library.noteSaveState != .idle {
+                    Label(library.noteSaveState.title,
+                          systemImage: library.noteSaveState == .failed ? "exclamationmark.circle" : "checkmark.circle")
+                        .font(.caption)
+                        .foregroundStyle(library.noteSaveState == .failed ? Color.red : Color.secondary)
+                }
                 Spacer()
                 Button { library.addImageToNote() } label: { Image(systemName: "photo.badge.plus") }
                     .buttonStyle(.plain).help("Agregar imagen a la nota")
@@ -301,11 +440,17 @@ private struct NotesPane: View {
                 formatButton(.bold, icon: "bold", help: "Negrita")
                 formatButton(.italic, icon: "italic", help: "Cursiva")
                 formatButton(.underline, icon: "underline", help: "Subrayado")
-                formatButton(.highlight, icon: "highlighter", help: "Marcatextos")
-                formatButton(.strikethrough, icon: "strikethrough", help: "Tachado")
                 formatButton(.bulletList, icon: "list.bullet", help: "Lista con viñetas (-)")
                 formatButton(.numberedList, icon: "list.number", help: "Lista numerada")
-                formatButton(.divider, icon: "minus", help: "Línea divisora")
+                formatButton(.taskList, icon: "checklist", help: "Lista de tareas")
+                Menu {
+                    Button("Marcatextos") { format(.highlight) }
+                    Button("Tachado") { format(.strikethrough) }
+                    Button("Insertar enlace") { format(.link) }
+                    Divider()
+                    Button("Línea divisora") { format(.divider) }
+                } label: { Image(systemName: "ellipsis.circle") }
+                .menuStyle(.borderlessButton).help("Más formatos")
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, 12).padding(.vertical, 8)
@@ -315,7 +460,8 @@ private struct NotesPane: View {
                 text: Binding(get: { library.noteText }, set: { library.setNoteText($0) }),
                 baseURL: library.selectedNoteFolder,
                 onPasteImage: { library.savePastedImage($0) },
-                formatCommand: formatCommand
+                formatCommand: formatCommand,
+                onSelectionFormatsChanged: { activeFormats = $0 }
             )
         }
     }
@@ -327,6 +473,7 @@ private struct NotesPane: View {
     private func formatButton(_ style: MarkdownFormatStyle, icon: String, help: String) -> some View {
         Button { format(style) } label: { Image(systemName: icon) }
             .buttonStyle(.plain)
+            .foregroundStyle(activeFormats.contains(style) ? Color.accentColor : Color.primary)
             .help(help)
     }
 }

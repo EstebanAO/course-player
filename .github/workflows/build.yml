@@ -1,0 +1,20 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build universal app
+        run: COURSE_PLAYER_ARCHS="arm64 x86_64" ./build-app.sh
+      - name: Package app
+        run: ditto -c -k --sequesterRsrc --keepParent ".build/Course Player.app" ".build/Course-Player.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Course-Player-macOS
+          path: .build/Course-Player.zip
+

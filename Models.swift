@@ -23,9 +23,45 @@ struct ProgressRecord: Codable, Equatable {
     var duration: Double = 0
     var completed: Bool = false
     var lastOpened: Date = .now
+    var completionSource: String?
 }
 
 struct ProgressFile: Codable {
     var version: Int = 1
     var records: [String: ProgressRecord] = [:]
+}
+
+enum LibraryFilter: String, CaseIterable, Identifiable {
+    case all, unstarted, inProgress, completed
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .all: return "Todos"
+        case .unstarted: return "Pendientes"
+        case .inProgress: return "En progreso"
+        case .completed: return "Completados"
+        }
+    }
+}
+
+enum NoteSaveState: Equatable {
+    case idle, saving, saved, failed
+
+    var title: String {
+        switch self {
+        case .idle: return ""
+        case .saving: return "Guardando…"
+        case .saved: return "Guardado"
+        case .failed: return "No se pudo guardar"
+        }
+    }
+}
+
+struct AppIssue: Identifiable, Equatable {
+    enum Action: Equatable { case retryVideo, chooseFFmpeg, revealLibrary }
+    let id = UUID()
+    let title: String
+    let message: String
+    let action: Action?
 }
