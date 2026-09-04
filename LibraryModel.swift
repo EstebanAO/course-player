@@ -31,6 +31,7 @@ final class LibraryModel: ObservableObject {
     @Published var issue: AppIssue?
     @Published var restoredSession = false
     @Published var expandedFolders: Set<String> = []
+    @Published var documentPage = 0
 
     let player = AVPlayer()
     private var progress = ProgressFile()
@@ -189,11 +190,11 @@ final class LibraryModel: ObservableObject {
 
     private func open(_ item: LibraryItem, autoplay: Bool) {
         guard item.kind != .folder else { return }
-        if item.kind == .document {
+        if item.kind == .document && item.url.pathExtension.lowercased() != "pdf" {
             NSWorkspace.shared.open(item.url)
             return
         }
-        guard item.isPlayable else { return }
+        guard item.isPlayable || item.url.pathExtension.lowercased() == "pdf" else { return }
         saveCurrentNoteNow()
         storeCurrentPosition()
         conversionProcess?.terminate()
@@ -210,11 +211,30 @@ final class LibraryModel: ObservableObject {
         updated.lastOpened = .now
         progress.records[item.relativePath] = updated
         scheduleProgressSave()
+        if item.url.pathExtension.lowercased() == "pdf" {
+            player.pause()
+            player.replaceCurrentItem(with: nil)
+            isPlaying = false
+            documentPage = max(0, record.pageIndex ?? 0)
+            statusMessage = "Documento listo"
+            return
+        }
         if item.url.pathExtension.lowercased() == "ts" {
             prepareTransportStream(item, autoplay: autoplay)
         } else {
             play(item.url, for: item, autoplay: autoplay)
         }
+    }
+
+    func setDocumentPage(_ page: Int) {
+        guard let item = selectedItem, item.url.pathExtension.lowercased() == "pdf" else { return }
+        let value = max(0, page)
+        documentPage = value
+        var record = progress.records[item.relativePath] ?? ProgressRecord()
+        record.pageIndex = value
+        record.lastOpened = .now
+        progress.records[item.relativePath] = record
+        scheduleProgressSave()
     }
 
     func togglePlayback() {
@@ -679,13 +699,15 @@ final class LibraryModel: ObservableObject {
 
     private func loadNote(for item: LibraryItem) {
         guard let url = noteURL(for: item) else { noteText = ""; return }
+        noteSaveState = .idle
         recoverNoteBackupIfNeeded(for: item, destination: url)
         recoverLegacyNoteIfNeeded(for: item, destination: url)
         if let existing = try? String(contentsOf: url, encoding: .utf8) {
             noteText = existing
         } else {
             let escapedPath = item.relativePath.replacingOccurrences(of: "\"", with: "\\\"")
-            noteText = "---\nvideo: \"\(escapedPath)\"\ncurso: \"\(item.relativePath.split(separator: "/").first ?? "")\"\n---\n\n# \(item.name)\n\n## Ideas principales\n\n- \n\n## Reflexiones\n\n"
+            let relation = item.kind == .document ? "documento" : "video"
+            noteText = "---\n\(relation): \"\(escapedPath)\"\ncurso: \"\(item.relativePath.split(separator: "/").first ?? "")\"\n---\n\n# \(item.name)\n\n## Ideas principales\n\n- \n\n## Reflexiones\n\n"
         }
     }
 
@@ -868,8 +890,10 @@ final class LibraryModel: ObservableObject {
     private func restoreLastVideo() {
         guard !didRestoreLastVideo else { return }
         didRestoreLastVideo = true
-        let videos = flatten(items).filter { $0.kind == .video }
-        guard let last = videos.max(by: {
+        let resumableItems = flatten(items).filter {
+            $0.isPlayable || $0.url.pathExtension.lowercased() == "pdf"
+        }
+        guard let last = resumableItems.max(by: {
             let first = progress.records[$0.relativePath]?.lastOpened ?? .distantPast
             let second = progress.records[$1.relativePath]?.lastOpened ?? .distantPast
             return first < second

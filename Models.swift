@@ -24,6 +24,7 @@ struct ProgressRecord: Codable, Equatable {
     var completed: Bool = false
     var lastOpened: Date = .now
     var completionSource: String?
+    var pageIndex: Int?
 }
 
 struct ProgressFile: Codable {
@@ -36,7 +37,9 @@ enum ProgressRecoveryPolicy {
         guard let current else { return true }
         if current.completionSource == "reset", current.lastOpened >= candidate.lastOpened { return false }
         let candidateHasStudyData = candidate.completed || candidate.position > 1 || candidate.duration > 1
+            || (candidate.pageIndex ?? 0) > 0
         let currentHasStudyData = current.completed || current.position > 1 || current.duration > 1
+            || (current.pageIndex ?? 0) > 0
         if candidateHasStudyData != currentHasStudyData { return candidateHasStudyData }
         return candidate.lastOpened > current.lastOpened
     }

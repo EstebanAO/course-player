@@ -13,6 +13,7 @@ It is designed for personal, offline-first use. Course files, notes, playback hi
 - Supports playback rates from 0.5× to 2×.
 - Provides previous/next controls and optional automatic playback of the next lesson.
 - Provides a resizable split view with the player and a live-preview Markdown editor.
+- Opens PDF course material inside the split view, keeps Markdown notes beside it, and remembers the last page read.
 - Saves one standard `.md` file per lesson in `Course Player Notes/`.
 - Supports headings, bold, italic, underline, highlight, strikethrough, links, code, quotes, dividers, bullet lists, numbered lists, and pasted images.
 - Stores application state in `.course-player/progress.json` inside the selected library.

@@ -32,6 +32,7 @@ for ARCH in "${BUILD_ARCHS[@]}"; do
     -framework CoreServices \
     -framework AVKit \
     -framework AVFoundation \
+    -framework PDFKit \
     "$SCRIPT_DIR/CoursePlayerApp.swift" \
     "$SCRIPT_DIR/Models.swift" \
     "$SCRIPT_DIR/LibraryModel.swift" \

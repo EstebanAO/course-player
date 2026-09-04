@@ -1,5 +1,6 @@
 import SwiftUI
 import AVKit
+import PDFKit
 import UniformTypeIdentifiers
 
 struct ContentView: View {
@@ -16,7 +17,11 @@ struct ContentView: View {
                     WelcomeView()
                 } else {
                     HSplitView {
-                        PlayerPane().frame(minWidth: 430)
+                        if library.selectedItem?.url.pathExtension.lowercased() == "pdf" {
+                            PDFPane().frame(minWidth: 430)
+                        } else {
+                            PlayerPane().frame(minWidth: 430)
+                        }
                         NotesPane().frame(minWidth: 330)
                     }
                 }
@@ -28,6 +33,110 @@ struct ContentView: View {
             library.openLibrary(folder)
             return true
         }
+    }
+}
+
+private struct PDFPane: View {
+    @EnvironmentObject private var library: LibraryModel
+    @State private var pageCount = 0
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if let item = library.selectedItem {
+                PDFDocumentView(
+                    url: item.url,
+                    pageIndex: Binding(get: { library.documentPage }, set: { library.setDocumentPage($0) }),
+                    onPageCountChanged: { pageCount = $0 }
+                )
+                Divider()
+                HStack(spacing: 14) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(item.name).font(.headline).lineLimit(1)
+                        Text(item.relativePath).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                    Spacer()
+                    Button { library.setDocumentPage(library.documentPage - 1) } label: {
+                        Image(systemName: "chevron.left")
+                    }
+                    .disabled(library.documentPage <= 0).help("Página anterior")
+                    Text(pageCount == 0 ? "—" : "Página \(library.documentPage + 1) de \(pageCount)")
+                        .font(.caption.monospacedDigit()).frame(minWidth: 110)
+                    Button { library.setDocumentPage(library.documentPage + 1) } label: {
+                        Image(systemName: "chevron.right")
+                    }
+                    .disabled(pageCount == 0 || library.documentPage + 1 >= pageCount).help("Página siguiente")
+                    Button { library.openSelectedExternally() } label: { Image(systemName: "arrow.up.forward.app") }
+                        .help("Abrir PDF en otra aplicación")
+                }
+                .padding(12).background(.bar)
+            }
+        }
+    }
+}
+
+private struct PDFDocumentView: NSViewRepresentable {
+    let url: URL
+    @Binding var pageIndex: Int
+    let onPageCountChanged: (Int) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> PDFView {
+        let view = PDFView()
+        view.autoScales = true
+        view.displayMode = .singlePageContinuous
+        view.displayDirection = .vertical
+        view.displaysPageBreaks = true
+        context.coordinator.connect(to: view)
+        load(url, into: view, coordinator: context.coordinator)
+        return view
+    }
+
+    func updateNSView(_ view: PDFView, context: Context) {
+        context.coordinator.parent = self
+        if context.coordinator.loadedURL != url {
+            load(url, into: view, coordinator: context.coordinator)
+        } else if let document = view.document,
+                  document.pageCount > 0,
+                  let current = view.currentPage,
+                  document.index(for: current) != pageIndex,
+                  let page = document.page(at: min(max(0, pageIndex), document.pageCount - 1)) {
+            context.coordinator.isNavigating = true
+            view.go(to: page)
+            context.coordinator.isNavigating = false
+        }
+    }
+
+    private func load(_ url: URL, into view: PDFView, coordinator: Coordinator) {
+        coordinator.loadedURL = url
+        view.document = PDFDocument(url: url)
+        let count = view.document?.pageCount ?? 0
+        DispatchQueue.main.async { onPageCountChanged(count) }
+        guard count > 0, let page = view.document?.page(at: min(max(0, pageIndex), count - 1)) else { return }
+        coordinator.isNavigating = true
+        view.go(to: page)
+        coordinator.isNavigating = false
+    }
+
+    final class Coordinator {
+        var parent: PDFDocumentView
+        var loadedURL: URL?
+        var isNavigating = false
+        private var observer: NSObjectProtocol?
+
+        init(_ parent: PDFDocumentView) { self.parent = parent }
+
+        func connect(to view: PDFView) {
+            observer = NotificationCenter.default.addObserver(
+                forName: .PDFViewPageChanged, object: view, queue: .main
+            ) { [weak self, weak view] _ in
+                guard let self, !self.isNavigating, let view,
+                      let document = view.document, let page = view.currentPage else { return }
+                self.parent.pageIndex = document.index(for: page)
+            }
+        }
+
+        deinit { if let observer { NotificationCenter.default.removeObserver(observer) } }
     }
 }
 
@@ -94,7 +203,9 @@ private struct LibrarySidebar: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Continuar estudiando").font(.caption.bold())
                             Text(item.name).lineLimit(1)
-                            Text("Desde \(library.displayTime(library.currentTime))")
+                            Text(item.url.pathExtension.lowercased() == "pdf"
+                                 ? "Página \(library.documentPage + 1)"
+                                 : "Desde \(library.displayTime(library.currentTime))")
                                 .font(.caption2).foregroundStyle(.secondary)
                         }
                         Spacer()
@@ -412,7 +523,9 @@ private struct NotesPane: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Label("Notas del video", systemImage: "square.and.pencil").font(.headline)
+                Label(library.selectedItem?.url.pathExtension.lowercased() == "pdf"
+                      ? "Notas del documento" : "Notas del video",
+                      systemImage: "square.and.pencil").font(.headline)
                 if library.noteSaveState != .idle {
                     Label(library.noteSaveState.title,
                           systemImage: library.noteSaveState == .failed ? "exclamationmark.circle" : "checkmark.circle")
