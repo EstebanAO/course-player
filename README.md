@@ -16,6 +16,7 @@ It is designed for personal, offline-first use. Course files, notes, playback hi
 - Saves one standard `.md` file per lesson in `Course Player Notes/`.
 - Supports headings, bold, italic, underline, highlight, strikethrough, links, code, quotes, dividers, bullet lists, numbered lists, and pasted images.
 - Stores application state in `.course-player/progress.json` inside the selected library.
+- Safely imports compatible progress and Markdown notes left by earlier versions, without deleting or modifying the originals.
 - Keeps at most three remuxed videos in the local cache.
 - Avoids periodic directory polling and batches progress writes to reduce energy use.
 - Includes library filters, visible lesson states, remembered folder expansion, contextual actions, actionable error banners, and note save feedback.

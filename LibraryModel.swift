@@ -198,6 +198,8 @@ final class LibraryModel: ObservableObject {
         selectedItem = item
         loadNote(for: item)
         let record = progress.records[item.relativePath] ?? ProgressRecord()
+        currentTime = record.position
+        duration = record.duration
         var updated = record
         updated.lastOpened = .now
         progress.records[item.relativePath] = updated
@@ -464,6 +466,8 @@ final class LibraryModel: ObservableObject {
             let values = try? url.resourceValues(forKeys: Set(keys))
             let relative = relativePath(for: url, root: root)
             if values?.isDirectory == true {
+                if directory.standardizedFileURL == root.standardizedFileURL,
+                   looksLikeLegacyNoteStore(url) { return nil }
                 let children = buildItems(at: url, root: root)
                 guard !children.isEmpty else { return nil }
                 return LibraryItem(id: relative, name: url.lastPathComponent, url: url, relativePath: relative, kind: .folder, children: children)
@@ -524,11 +528,48 @@ final class LibraryModel: ObservableObject {
     private func loadProgress() {
         progress = ProgressFile()
         lastProgressSave = .now
-        guard let url = progressURL, let data = try? Data(contentsOf: url) else { return }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        guard let decoded = try? decoder.decode(ProgressFile.self, from: data) else { return }
-        progress = decoded
+        if let url = progressURL,
+           let data = try? Data(contentsOf: url),
+           let decoded = try? decoder.decode(ProgressFile.self, from: data) {
+            progress = decoded
+        }
+
+        var recovered = false
+        for url in compatibleLegacyProgressURLs() {
+            guard let data = try? Data(contentsOf: url),
+                  let legacy = try? decoder.decode(ProgressFile.self, from: data) else { continue }
+            for (path, candidate) in legacy.records {
+                if shouldRecover(candidate, over: progress.records[path]) {
+                    progress.records[path] = candidate
+                    recovered = true
+                }
+            }
+        }
+        if recovered { saveProgressNow() }
+    }
+
+    private func compatibleLegacyProgressURLs() -> [URL] {
+        guard let rootURL,
+              let children = try? FileManager.default.contentsOfDirectory(
+                at: rootURL, includingPropertiesForKeys: [.isDirectoryKey], options: []
+              ) else { return [] }
+        return children.compactMap { directory in
+            guard directory.lastPathComponent.hasPrefix("."),
+                  directory.lastPathComponent != ".course-player",
+                  (try? directory.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return nil }
+            let candidate = directory.appendingPathComponent("progress.json")
+            return FileManager.default.fileExists(atPath: candidate.path) ? candidate : nil
+        }
+    }
+
+    private func shouldRecover(_ candidate: ProgressRecord, over current: ProgressRecord?) -> Bool {
+        guard let current else { return true }
+        let candidateHasStudyData = candidate.completed || candidate.position > 1 || candidate.duration > 1
+        let currentHasStudyData = current.completed || current.position > 1 || current.duration > 1
+        if candidateHasStudyData != currentHasStudyData { return candidateHasStudyData }
+        return candidate.lastOpened > current.lastOpened
     }
 
     private func scheduleProgressSave() {
@@ -588,11 +629,81 @@ final class LibraryModel: ObservableObject {
 
     private func loadNote(for item: LibraryItem) {
         guard let url = noteURL(for: item) else { noteText = ""; return }
+        recoverLegacyNoteIfNeeded(for: item, destination: url)
         if let existing = try? String(contentsOf: url, encoding: .utf8) {
             noteText = existing
         } else {
             let escapedPath = item.relativePath.replacingOccurrences(of: "\"", with: "\\\"")
             noteText = "---\nvideo: \"\(escapedPath)\"\ncurso: \"\(item.relativePath.split(separator: "/").first ?? "")\"\n---\n\n# \(item.name)\n\n## Ideas principales\n\n- \n\n## Reflexiones\n\n"
+        }
+    }
+
+    private func recoverLegacyNoteIfNeeded(for item: LibraryItem, destination: URL) {
+        guard !FileManager.default.fileExists(atPath: destination.path), let rootURL else { return }
+        let manager = FileManager.default
+        let relativeNotePath = URL(fileURLWithPath: item.relativePath)
+            .deletingPathExtension().appendingPathExtension("md").path
+        guard let roots = try? manager.contentsOfDirectory(
+            at: rootURL, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]
+        ) else { return }
+
+        for noteRoot in roots where noteRoot.lastPathComponent != "Course Player Notes" {
+            guard looksLikeLegacyNoteStore(noteRoot) else { continue }
+            let source = noteRoot.appendingPathComponent(relativeNotePath)
+            guard manager.fileExists(atPath: source.path),
+                  let markdown = try? String(contentsOf: source, encoding: .utf8) else { continue }
+            do {
+                try manager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try manager.copyItem(at: source, to: destination)
+                recoverReferencedImages(in: markdown, from: source.deletingLastPathComponent(),
+                                        to: destination.deletingLastPathComponent())
+            } catch {
+                issue = AppIssue(title: "No se pudo recuperar una nota",
+                                 message: "La nota original se conservó intacta. Comprueba los permisos de la biblioteca.",
+                                 action: .revealLibrary)
+            }
+            return
+        }
+    }
+
+    private func looksLikeLegacyNoteStore(_ directory: URL) -> Bool {
+        var isDirectory: ObjCBool = false
+        let normalizedName = directory.lastPathComponent.folding(
+            options: [.diacriticInsensitive, .caseInsensitive], locale: .current
+        )
+        guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory),
+              isDirectory.boolValue,
+              directory.lastPathComponent != "Course Player Notes",
+              normalizedName.localizedCaseInsensitiveContains("note")
+                || normalizedName.localizedCaseInsensitiveContains("nota") else { return false }
+        guard let enumerator = FileManager.default.enumerator(
+            at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
+        ) else { return false }
+        var checked = 0
+        for case let url as URL in enumerator where url.pathExtension.lowercased() == "md" {
+            checked += 1
+            if let prefix = try? String(contentsOf: url, encoding: .utf8).prefix(600),
+               prefix.hasPrefix("---"), prefix.contains("\nvideo:") { return true }
+            if checked >= 8 { break }
+        }
+        return false
+    }
+
+    private func recoverReferencedImages(in markdown: String, from sourceFolder: URL, to destinationFolder: URL) {
+        guard let regex = try? NSRegularExpression(pattern: #"!\[[^\]]*\]\(([^\)]+)\)"#) else { return }
+        let ns = markdown as NSString
+        for match in regex.matches(in: markdown, range: NSRange(location: 0, length: ns.length)) {
+            guard match.numberOfRanges > 1,
+                  let path = ns.substring(with: match.range(at: 1)).removingPercentEncoding,
+                  !path.contains("://"), !path.hasPrefix("/") else { continue }
+            let source = sourceFolder.appendingPathComponent(path).standardizedFileURL
+            let destination = destinationFolder.appendingPathComponent(path).standardizedFileURL
+            guard source.path.hasPrefix(sourceFolder.standardizedFileURL.path + "/"),
+                  destination.path.hasPrefix(destinationFolder.standardizedFileURL.path + "/"),
+                  FileManager.default.fileExists(atPath: source.path),
+                  !FileManager.default.fileExists(atPath: destination.path) else { continue }
+            try? FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? FileManager.default.copyItem(at: source, to: destination)
         }
     }
 
