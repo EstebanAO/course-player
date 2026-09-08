@@ -27,6 +27,12 @@ struct PausedVideoTextOverlay: NSViewRepresentable {
         )
     }
 
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: PausedVideoTextContainer,
+                      context: Context) -> CGSize? {
+        guard let width = proposal.width, let height = proposal.height else { return nil }
+        return CGSize(width: width, height: height)
+    }
+
     static func dismantleNSView(_ view: PausedVideoTextContainer, coordinator: ()) {
         view.deactivate()
     }
@@ -46,6 +52,10 @@ final class PausedVideoTextContainer: NSView, ImageAnalysisOverlayViewDelegate {
     private var backgroundAction: (() -> Void)?
     private var addToNotesAction: ((String) -> Void)?
 
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
+    }
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
@@ -56,6 +66,10 @@ final class PausedVideoTextContainer: NSView, ImageAnalysisOverlayViewDelegate {
         // tracks this image to position Live Text, but the captured frame must not
         // replace the player because anamorphic video can otherwise appear zoomed.
         imageView.alphaValue = 0.001
+        imageView.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        imageView.setContentHuggingPriority(.defaultLow, for: .vertical)
+        imageView.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        imageView.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
         imageView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(imageView)
 

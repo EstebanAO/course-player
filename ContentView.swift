@@ -442,6 +442,7 @@ private struct PlayerPane: View {
                         onBackgroundClick: { library.togglePlayback() },
                         onAddToNotes: { library.appendRecognizedTextToNote($0) }
                     )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .help("Arrastra sobre el texto para seleccionarlo; haz clic fuera para reproducir")
                 } else {
                     VStack(spacing: 0) {
