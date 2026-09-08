@@ -9,6 +9,7 @@ It is designed for personal, offline-first use. Course files, notes, playback hi
 - Recursively indexes folders and subfolders and updates when macOS reports file changes.
 - Plays MP4, MOV, M4V, common audio formats, and MPEG transport streams (`.ts`) through FFmpeg remuxing.
 - Remembers the last opened lesson, playback position, completion state, and playback speed.
+- Recognizes text locally when a video is paused, so it can be selected and copied directly from the frame.
 - Opens the last lesson paused with a clear **Continue studying** action.
 - Supports playback rates from 0.5× to 2×.
 - Provides previous/next controls and optional automatic playback of the next lesson.
@@ -20,6 +21,7 @@ It is designed for personal, offline-first use. Course files, notes, playback hi
 - Safely imports compatible progress and Markdown notes left by earlier versions, without deleting or modifying the originals.
 - Creates rotating per-session backups for progress and edited notes, and automatically considers those backups during recovery.
 - Refuses to replace a valid playback position when media did not load successfully.
+- Waits for the saved playback position to be restored before recording new time updates.
 - Keeps at most three remuxed videos in the local cache.
 - Avoids periodic directory polling and batches progress writes to reduce energy use.
 - Includes library filters, visible lesson states, remembered folder expansion, contextual actions, actionable error banners, and note save feedback.

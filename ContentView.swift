@@ -432,14 +432,27 @@ private struct PlayerPane: View {
             ZStack {
                 Color.black
                 VideoPlayer(player: library.player)
-                VStack(spacing: 0) {
-                    Color.clear
-                        .contentShape(Rectangle())
-                        .onTapGesture { library.togglePlayback() }
-                        .help(library.isPlaying ? "Pausar" : "Reproducir")
-                    Color.clear
-                        .frame(height: 64)
-                        .allowsHitTesting(false)
+                if !library.isPlaying, !library.isPreparingVideo,
+                   let item = library.selectedItem, item.isPlayable {
+                    PausedVideoTextOverlay(
+                        player: library.player,
+                        videoID: item.id,
+                        time: library.currentTime,
+                        isActive: true,
+                        onBackgroundClick: { library.togglePlayback() },
+                        onAddToNotes: { library.appendRecognizedTextToNote($0) }
+                    )
+                    .help("Arrastra sobre el texto para seleccionarlo; haz clic fuera para reproducir")
+                } else {
+                    VStack(spacing: 0) {
+                        Color.clear
+                            .contentShape(Rectangle())
+                            .onTapGesture { library.togglePlayback() }
+                            .help("Pausar")
+                        Color.clear
+                            .frame(height: 64)
+                            .allowsHitTesting(false)
+                    }
                 }
                 if library.isPreparingVideo {
                     VStack(spacing: 14) {

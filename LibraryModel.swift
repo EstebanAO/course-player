@@ -42,6 +42,8 @@ final class LibraryModel: ObservableObject {
     private var conversionProcess: Process?
     private var conversionProgressTimer: DispatchSourceTimer?
     private var conversionWasCancelled = false
+    private var isRestoringPlaybackPosition = false
+    private var playbackGeneration = UUID()
     private var playbackEndObserver: NSObjectProtocol?
     private var libraryEventStream: FSEventStreamRef?
     private var lastProgressSave = Date.distantPast
@@ -238,7 +240,7 @@ final class LibraryModel: ObservableObject {
     }
 
     func togglePlayback() {
-        guard selectedItem?.isPlayable == true, !isPreparingVideo else { return }
+        guard selectedItem?.isPlayable == true, !isPreparingVideo, !isRestoringPlaybackPosition else { return }
         if isPlaying {
             player.pause()
             isPlaying = false
@@ -315,6 +317,17 @@ final class LibraryModel: ObservableObject {
             guard !Task.isCancelled else { return }
             self?.saveCurrentNoteNow()
         }
+    }
+
+    func appendRecognizedTextToNote(_ recognizedText: String) {
+        let text = recognizedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        let quoted = text.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { "> \($0)" }
+            .joined(separator: "\n")
+        let separator = noteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "" : "\n\n"
+        setNoteText(noteText + separator + "> **\(displayTime(currentTime))**\n" + quoted)
+        saveCurrentNoteNow()
     }
 
     func retryLastIssue() {
@@ -927,14 +940,29 @@ final class LibraryModel: ObservableObject {
         let record = progress.records[item.relativePath] ?? ProgressRecord()
         currentTime = record.position
         duration = record.duration
+        let itemID = item.id
+        let generation = UUID()
+        playbackGeneration = generation
+        isRestoringPlaybackPosition = true
+        isPlaying = false
+        player.pause()
         player.replaceCurrentItem(with: AVPlayerItem(url: url))
-        player.seek(to: CMTime(seconds: record.position, preferredTimescale: 600))
-        if autoplay {
-            player.playImmediately(atRate: playbackRate)
-            isPlaying = true
-        } else {
-            player.pause()
-            isPlaying = false
+        let target = CMTime(seconds: max(0, record.position), preferredTimescale: 600)
+        player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
+            Task { @MainActor in
+                guard let self, self.playbackGeneration == generation,
+                      self.selectedItem?.id == itemID else { return }
+                self.isRestoringPlaybackPosition = false
+                guard finished else { return }
+                self.currentTime = max(0, record.position)
+                if autoplay {
+                    self.player.playImmediately(atRate: self.playbackRate)
+                    self.isPlaying = true
+                } else {
+                    self.player.pause()
+                    self.isPlaying = false
+                }
+            }
         }
         isPreparingVideo = false
         preparationProgress = nil
@@ -1142,6 +1170,7 @@ final class LibraryModel: ObservableObject {
         timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
             Task { @MainActor in
                 guard let self, let item = self.selectedItem else { return }
+                guard !self.isRestoringPlaybackPosition else { return }
                 self.currentTime = max(0, time.seconds.isFinite ? time.seconds : 0)
                 let itemDuration = self.player.currentItem?.duration.seconds ?? 0
                 if itemDuration.isFinite, itemDuration > 0 { self.duration = itemDuration }
