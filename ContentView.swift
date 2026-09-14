@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @EnvironmentObject private var library: LibraryModel
+    @AppStorage("CoursePlayerNotesVisible") private var notesVisible = true
 
     var body: some View {
         VStack(spacing: 0) {
@@ -15,15 +16,14 @@ struct ContentView: View {
             } detail: {
                 if library.selectedItem == nil {
                     WelcomeView()
-                } else {
+                } else if notesVisible {
                     HSplitView {
-                        if library.selectedItem?.url.pathExtension.lowercased() == "pdf" {
-                            PDFPane().frame(minWidth: 430)
-                        } else {
-                            PlayerPane().frame(minWidth: 430)
-                        }
+                        PrimaryPane(notesVisible: $notesVisible)
+                            .frame(minWidth: 430)
                         NotesPane().frame(minWidth: 330)
                     }
+                } else {
+                    PrimaryPane(notesVisible: $notesVisible)
                 }
             }
         }
@@ -36,8 +36,22 @@ struct ContentView: View {
     }
 }
 
+private struct PrimaryPane: View {
+    @EnvironmentObject private var library: LibraryModel
+    @Binding var notesVisible: Bool
+
+    var body: some View {
+        if library.selectedItem?.url.pathExtension.lowercased() == "pdf" {
+            PDFPane(notesVisible: $notesVisible)
+        } else {
+            PlayerPane(notesVisible: $notesVisible)
+        }
+    }
+}
+
 private struct PDFPane: View {
     @EnvironmentObject private var library: LibraryModel
+    @Binding var notesVisible: Bool
     @State private var pageCount = 0
 
     var body: some View {
@@ -65,6 +79,11 @@ private struct PDFPane: View {
                         Image(systemName: "chevron.right")
                     }
                     .disabled(pageCount == 0 || library.documentPage + 1 >= pageCount).help("Página siguiente")
+                    Button { notesVisible.toggle() } label: {
+                        Image(systemName: "sidebar.trailing")
+                    }
+                    .keyboardShortcut("n", modifiers: [.command, .shift])
+                    .help(notesVisible ? "Ocultar notas" : "Mostrar notas")
                     Button { library.openSelectedExternally() } label: { Image(systemName: "arrow.up.forward.app") }
                         .help("Abrir PDF en otra aplicación")
                 }
@@ -284,6 +303,10 @@ private struct LibraryRow: View {
                 ForEach(item.children ?? []) { child in LibraryRow(item: child) }
             } label: {
                 HStack(spacing: 7) {
+                    Image(systemName: courseStatusIcon)
+                        .foregroundStyle(courseStatusColor)
+                        .frame(width: 14)
+                        .help(courseStatusHelp)
                     Image(systemName: "books.vertical.fill").foregroundStyle(.orange)
                     Text(item.name).lineLimit(2)
                     Spacer(minLength: 4)
@@ -305,6 +328,35 @@ private struct LibraryRow: View {
                     Divider()
                     Button("Abrir archivo original") { NSWorkspace.shared.open(item.url) }
                 }
+        }
+    }
+
+    private var courseStatus: CourseProgressState {
+        library.progressStateForCourse(item)
+    }
+
+    private var courseStatusIcon: String {
+        switch courseStatus {
+        case .unstarted: return "circle"
+        case .inProgress: return "circle.lefthalf.filled"
+        case .completed: return "checkmark.circle.fill"
+        }
+    }
+
+    private var courseStatusColor: Color {
+        switch courseStatus {
+        case .unstarted: return .secondary.opacity(0.35)
+        case .inProgress: return .orange
+        case .completed: return .green
+        }
+    }
+
+    private var courseStatusHelp: String {
+        let count = library.completedCount(for: item)
+        switch courseStatus {
+        case .unstarted: return "Curso sin comenzar"
+        case .inProgress: return "Curso comenzado · \(count.completed) de \(count.total) videos completados"
+        case .completed: return "Curso completado"
         }
     }
 }
@@ -425,36 +477,19 @@ private struct AppLogo: View {
 
 private struct PlayerPane: View {
     @EnvironmentObject private var library: LibraryModel
+    @Binding var notesVisible: Bool
+    @State private var fullscreenCommand: VideoFullscreenCommand?
     private let rates: [Float] = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2]
 
     var body: some View {
         VStack(spacing: 0) {
             ZStack {
                 Color.black
-                VideoPlayer(player: library.player)
-                if !library.isPlaying, !library.isPreparingVideo,
-                   let item = library.selectedItem, item.isPlayable {
-                    PausedVideoTextOverlay(
-                        player: library.player,
-                        videoID: item.id,
-                        time: library.currentTime,
-                        isActive: true,
-                        onBackgroundClick: { library.togglePlayback() },
-                        onAddToNotes: { library.appendRecognizedTextToNote($0) }
-                    )
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .help("Arrastra sobre el texto para seleccionarlo; haz clic fuera para reproducir")
-                } else {
-                    VStack(spacing: 0) {
-                        Color.clear
-                            .contentShape(Rectangle())
-                            .onTapGesture { library.togglePlayback() }
-                            .help("Pausar")
-                        Color.clear
-                            .frame(height: 64)
-                            .allowsHitTesting(false)
-                    }
-                }
+                NativeVideoPlayer(
+                    player: library.player,
+                    fullscreenCommand: fullscreenCommand,
+                    onVideoClick: { library.togglePlayback() }
+                )
                 if library.isPreparingVideo {
                     VStack(spacing: 14) {
                         ProgressView().controlSize(.large)
@@ -492,33 +527,61 @@ private struct PlayerPane: View {
                     Text(library.displayTime(library.duration)).font(.caption.monospacedDigit()).frame(width: 54, alignment: .leading)
                 }
 
-                HStack(spacing: 14) {
-                    Button { library.playPrevious() } label: { Image(systemName: "backward.end") }
-                        .buttonStyle(.plain).disabled(library.previousItem == nil).help("Video anterior")
-                    Button { library.skip(seconds: -15) } label: { Image(systemName: "gobackward.15") }.buttonStyle(.plain)
-                    Button { library.togglePlayback() } label: {
-                        Image(systemName: library.isPlaying ? "pause.circle.fill" : "play.circle.fill").font(.system(size: 34))
-                    }.buttonStyle(.plain)
-                    Button { library.skip(seconds: 15) } label: { Image(systemName: "goforward.15") }.buttonStyle(.plain)
-                    Button { library.playNext() } label: { Image(systemName: "forward.end") }
-                        .buttonStyle(.plain).disabled(library.nextItem == nil).help("Siguiente video")
-                    Spacer()
-                    Menu {
-                        ForEach(rates, id: \.self) { rate in
-                            Button { library.setRate(rate) } label: {
-                                if library.playbackRate == rate { Label("\(rate.formatted())×", systemImage: "checkmark") }
-                                else { Text("\(rate.formatted())×") }
+                ZStack {
+                    HStack {
+                        Menu {
+                            ForEach(rates, id: \.self) { rate in
+                                Button { library.setRate(rate) } label: {
+                                    if library.playbackRate == rate { Label("\(rate.formatted())×", systemImage: "checkmark") }
+                                    else { Text("\(rate.formatted())×") }
+                                }
                             }
+                        } label: {
+                            Label("\(library.playbackRate.formatted())×", systemImage: "speedometer")
+                                .monospacedDigit()
                         }
-                    } label: { Text("\(library.playbackRate.formatted())×").monospacedDigit().frame(minWidth: 42) }
-                    .menuStyle(.borderlessButton)
-                    Toggle(isOn: Binding(get: { library.autoPlayNext }, set: { library.autoPlayNext = $0 })) {
-                        Image(systemName: "forward.end.circle")
+                        .menuStyle(.borderlessButton)
+                        .help("Velocidad de reproducción")
+
+                        Spacer()
+
+                        HStack(spacing: 6) {
+                            Button { notesVisible.toggle() } label: {
+                                Image(systemName: "sidebar.trailing")
+                            }
+                            .keyboardShortcut("n", modifiers: [.command, .shift])
+                            .help(notesVisible ? "Ocultar notas" : "Mostrar notas")
+                            Button { fullscreenCommand = VideoFullscreenCommand() } label: {
+                                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                            }
+                            .keyboardShortcut("f", modifiers: [.command, .shift])
+                            .help("Pantalla completa")
+                            Button { library.openSelectedExternally() } label: {
+                                Image(systemName: "arrow.up.forward.app")
+                            }
+                            .help("Abrir archivo original")
+                        }
+                        .buttonStyle(.borderless)
                     }
-                    .toggleStyle(.button).buttonStyle(.plain).help("Reproducir siguiente automáticamente")
-                    Button { library.openSelectedExternally() } label: { Image(systemName: "arrow.up.forward.app") }
-                        .buttonStyle(.plain).help("Abrir archivo original")
+
+                    HStack(spacing: 18) {
+                        Button { library.playPrevious() } label: { Image(systemName: "backward.end") }
+                            .disabled(library.previousItem == nil).help("Video anterior")
+                        Button { library.skip(seconds: -15) } label: { Image(systemName: "gobackward.15") }
+                            .help("Retroceder 15 segundos")
+                        Button { library.togglePlayback() } label: {
+                            Image(systemName: library.isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                                .font(.system(size: 36))
+                        }
+                        .help(library.isPlaying ? "Pausar" : "Reproducir")
+                        Button { library.skip(seconds: 15) } label: { Image(systemName: "goforward.15") }
+                            .help("Adelantar 15 segundos")
+                        Button { library.playNext() } label: { Image(systemName: "forward.end") }
+                            .disabled(library.nextItem == nil).help("Siguiente video")
+                    }
+                    .buttonStyle(.borderless)
                 }
+                .frame(minHeight: 38)
                 if !library.statusMessage.isEmpty && library.statusMessage != "Listo" {
                     Text(library.statusMessage).font(.caption).foregroundStyle(.secondary)
                 }
@@ -526,6 +589,93 @@ private struct PlayerPane: View {
             .padding(14)
             .background(.bar)
         }
+    }
+}
+
+private struct VideoFullscreenCommand: Equatable {
+    let id = UUID()
+}
+
+private struct NativeVideoPlayer: NSViewRepresentable {
+    let player: AVPlayer
+    let fullscreenCommand: VideoFullscreenCommand?
+    let onVideoClick: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> ClickableAVPlayerView {
+        let view = ClickableAVPlayerView()
+        view.player = player
+        view.controlsStyle = .minimal
+        view.showsFullScreenToggleButton = true
+        view.allowsVideoFrameAnalysis = true
+        view.onVideoClick = onVideoClick
+        if #available(macOS 14.0, *) {
+            view.videoFrameAnalysisTypes = [.text]
+        }
+        return view
+    }
+
+    func updateNSView(_ view: ClickableAVPlayerView, context: Context) {
+        if view.player !== player { view.player = player }
+        view.onVideoClick = onVideoClick
+        view.allowsVideoFrameAnalysis = true
+        if #available(macOS 14.0, *) {
+            view.videoFrameAnalysisTypes = [.text]
+        }
+        guard let command = fullscreenCommand,
+              context.coordinator.lastCommandID != command.id else { return }
+        context.coordinator.lastCommandID = command.id
+        DispatchQueue.main.async { [weak view] in
+            guard let view else { return }
+            if view.isInFullScreenMode {
+                view.exitFullScreenMode(options: nil)
+            } else if let screen = view.window?.screen ?? NSScreen.main {
+                _ = view.enterFullScreenMode(screen, withOptions: [
+                    .fullScreenModeApplicationPresentationOptions:
+                        NSApplication.PresentationOptions.autoHideMenuBar.rawValue
+                        | NSApplication.PresentationOptions.autoHideDock.rawValue
+                ])
+            }
+        }
+    }
+
+    final class Coordinator {
+        var lastCommandID: UUID?
+    }
+}
+
+private final class ClickableAVPlayerView: AVPlayerView, NSGestureRecognizerDelegate {
+    var onVideoClick: (() -> Void)?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configureVideoClick()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configureVideoClick()
+    }
+
+    private func configureVideoClick() {
+        let click = NSClickGestureRecognizer(target: self, action: #selector(videoWasClicked(_:)))
+        click.numberOfClicksRequired = 1
+        click.delegate = self
+        addGestureRecognizer(click)
+    }
+
+    @objc private func videoWasClicked(_ recognizer: NSClickGestureRecognizer) {
+        guard recognizer.state == .ended else { return }
+        guard recognizer.location(in: self).y > 64 else { return }
+        onVideoClick?()
+    }
+
+    func gestureRecognizer(
+        _ gestureRecognizer: NSGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: NSGestureRecognizer
+    ) -> Bool {
+        true
     }
 }
 
@@ -586,6 +736,7 @@ private struct NotesPane: View {
             Divider()
             LiveMarkdownEditor(
                 text: Binding(get: { library.noteText }, set: { library.setNoteText($0) }),
+                documentID: library.selectedItem?.id,
                 baseURL: library.selectedNoteFolder,
                 onPasteImage: { library.savePastedImage($0) },
                 formatCommand: formatCommand,

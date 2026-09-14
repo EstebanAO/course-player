@@ -35,10 +35,6 @@ struct CoursePlayerApp: App {
                     .keyboardShortcut("j", modifiers: [.command, .option])
                 Button("Adelantar 15 segundos") { library.skip(seconds: 15) }
                     .keyboardShortcut("l", modifiers: [.command, .option])
-                Divider()
-                Toggle("Reproducir siguiente automáticamente", isOn: Binding(
-                    get: { library.autoPlayNext }, set: { library.autoPlayNext = $0 }
-                ))
             }
         }
 
@@ -52,12 +48,10 @@ struct CoursePlayerApp: App {
 
 private struct CoursePlayerSettingsView: View {
     @EnvironmentObject private var library: LibraryModel
-    @AppStorage("CoursePlayerAutoPlayNext") private var autoPlayNext = false
 
     var body: some View {
         Form {
             Section("Reproducción") {
-                Toggle("Reproducir el siguiente video automáticamente", isOn: $autoPlayNext)
                 Picker("Velocidad preferida", selection: Binding(
                     get: { Double(library.playbackRate) },
                     set: { library.setRate(Float($0)) }

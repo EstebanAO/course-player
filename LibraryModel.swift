@@ -3,6 +3,7 @@ import AVFoundation
 import AppKit
 import CoreServices
 import UniformTypeIdentifiers
+import IOKit.pwr_mgt
 
 private let libraryEventsCallback: FSEventStreamCallback = { _, clientInfo, _, eventPaths, _, _ in
     guard let clientInfo else { return }
@@ -45,6 +46,8 @@ final class LibraryModel: ObservableObject {
     private var isRestoringPlaybackPosition = false
     private var playbackGeneration = UUID()
     private var playbackEndObserver: NSObjectProtocol?
+    private var playbackStatusObserver: NSKeyValueObservation?
+    private var displaySleepAssertionID: IOPMAssertionID = 0
     private var libraryEventStream: FSEventStreamRef?
     private var lastProgressSave = Date.distantPast
     private var didStart = false
@@ -88,11 +91,6 @@ final class LibraryModel: ObservableObject {
     var videos: [LibraryItem] { flatten(items).filter { $0.kind == .video } }
     var nextItem: LibraryItem? { adjacentItem(offset: 1) }
     var previousItem: LibraryItem? { adjacentItem(offset: -1) }
-    var autoPlayNext: Bool {
-        get { UserDefaults.standard.bool(forKey: "CoursePlayerAutoPlayNext") }
-        set { UserDefaults.standard.set(newValue, forKey: "CoursePlayerAutoPlayNext"); objectWillChange.send() }
-    }
-
     func start() {
         guard !didStart else { return }
         didStart = true
@@ -106,6 +104,9 @@ final class LibraryModel: ObservableObject {
             forName: .AVPlayerItemDidPlayToEndTime, object: nil, queue: .main
         ) { [weak self] _ in
             Task { @MainActor in self?.playbackDidEnd() }
+        }
+        playbackStatusObserver = player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] player, _ in
+            Task { @MainActor in self?.playbackStatusChanged(player.timeControlStatus) }
         }
 
         if let savedPath = UserDefaults.standard.string(forKey: savedLibraryKey) {
@@ -132,6 +133,8 @@ final class LibraryModel: ObservableObject {
             FSEventStreamInvalidate(stream)
         }
         if let playbackEndObserver { NotificationCenter.default.removeObserver(playbackEndObserver) }
+        playbackStatusObserver?.invalidate()
+        if displaySleepAssertionID != 0 { IOPMAssertionRelease(displaySleepAssertionID) }
         conversionProgressTimer?.cancel()
     }
 
@@ -319,17 +322,6 @@ final class LibraryModel: ObservableObject {
         }
     }
 
-    func appendRecognizedTextToNote(_ recognizedText: String) {
-        let text = recognizedText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
-        let quoted = text.split(separator: "\n", omittingEmptySubsequences: false)
-            .map { "> \($0)" }
-            .joined(separator: "\n")
-        let separator = noteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "" : "\n\n"
-        setNoteText(noteText + separator + "> **\(displayTime(currentTime))**\n" + quoted)
-        saveCurrentNoteNow()
-    }
-
     func retryLastIssue() {
         guard let action = issue?.action else { issue = nil; return }
         issue = nil
@@ -474,6 +466,7 @@ final class LibraryModel: ObservableObject {
         storeCurrentPosition()
         saveCurrentNoteNow()
         saveProgressNow()
+        releaseDisplaySleepAssertion()
     }
 
     func revealLibrary() {
@@ -485,6 +478,17 @@ final class LibraryModel: ObservableObject {
         guard !videos.isEmpty else { return 0 }
         let done = videos.filter { progress.records[$0.relativePath]?.completed == true }.count
         return Double(done) / Double(videos.count)
+    }
+
+    func progressStateForCourse(_ item: LibraryItem) -> CourseProgressState {
+        let courseVideos = flatten(item.children ?? []).filter { $0.kind == .video }
+        guard !courseVideos.isEmpty else { return .unstarted }
+        if courseVideos.allSatisfy(isCompleted) { return .completed }
+        let hasStarted = courseVideos.contains { video in
+            guard let record = progress.records[video.relativePath] else { return false }
+            return record.completed || record.position > 1
+        }
+        return hasStarted ? .inProgress : .unstarted
     }
 
     func isCompleted(_ item: LibraryItem) -> Bool {
@@ -924,15 +928,42 @@ final class LibraryModel: ObservableObject {
         record.completionSource = "watched"
         progress.records[item.relativePath] = record
         isPlaying = false
+        releaseDisplaySleepAssertion()
         saveProgressNow()
         objectWillChange.send()
-        if autoPlayNext, let nextItem {
-            open(nextItem, autoplay: true)
-        } else if nextItem != nil {
+        if nextItem != nil {
             statusMessage = "Lección completada · Siguiente disponible"
         } else {
             statusMessage = "Lección completada"
         }
+    }
+
+    private func playbackStatusChanged(_ status: AVPlayer.TimeControlStatus) {
+        let playbackActive = player.currentItem != nil && status != .paused
+        isPlaying = playbackActive
+        if playbackActive {
+            acquireDisplaySleepAssertion()
+        } else {
+            releaseDisplaySleepAssertion()
+        }
+    }
+
+    private func acquireDisplaySleepAssertion() {
+        guard displaySleepAssertionID == 0 else { return }
+        var assertionID = IOPMAssertionID(0)
+        let result = IOPMAssertionCreateWithName(
+            kIOPMAssertionTypeNoDisplaySleep as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            "Course Player está reproduciendo un video" as CFString,
+            &assertionID
+        )
+        if result == kIOReturnSuccess { displaySleepAssertionID = assertionID }
+    }
+
+    private func releaseDisplaySleepAssertion() {
+        guard displaySleepAssertionID != 0 else { return }
+        IOPMAssertionRelease(displaySleepAssertionID)
+        displaySleepAssertionID = 0
     }
 
     private func play(_ url: URL, for item: LibraryItem, autoplay: Bool) {

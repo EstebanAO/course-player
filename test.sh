@@ -14,3 +14,15 @@ trap 'rm -rf "$TEST_DIR"' EXIT
   -o "$TEST_DIR/data-durability-tests"
 
 "$TEST_DIR/data-durability-tests"
+
+/usr/bin/swiftc \
+  -swift-version 5 \
+  -parse-as-library \
+  -module-cache-path "$TEST_DIR/editor-module-cache" \
+  -framework SwiftUI \
+  -framework AppKit \
+  "$SCRIPT_DIR/LiveMarkdownEditor.swift" \
+  "$SCRIPT_DIR/Tests/EditorBehaviorTests.swift" \
+  -o "$TEST_DIR/editor-behavior-tests"
+
+"$TEST_DIR/editor-behavior-tests"

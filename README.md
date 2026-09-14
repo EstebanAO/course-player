@@ -12,8 +12,11 @@ It is designed for personal, offline-first use. Course files, notes, playback hi
 - Recognizes text locally when a video is paused, so it can be selected and copied directly from the frame.
 - Opens the last lesson paused with a clear **Continue studying** action.
 - Supports playback rates from 0.5× to 2×.
-- Provides previous/next controls and optional automatic playback of the next lesson.
+- Provides previous/next controls without automatically starting another lesson.
+- Keeps the display awake while a video is actively playing and returns control to the system when paused.
+- Supports full-screen video and lets the notes pane be hidden when more viewing space is needed.
 - Provides a resizable split view with the player and a live-preview Markdown editor.
+- Shows pending, started, and completed status at both lesson and course level.
 - Opens PDF course material inside the split view, keeps Markdown notes beside it, and remembers the last page read.
 - Saves one standard `.md` file per lesson in `Course Player Notes/`.
 - Supports headings, bold, italic, underline, highlight, strikethrough, links, code, quotes, dividers, bullet lists, numbered lists, and pasted images.

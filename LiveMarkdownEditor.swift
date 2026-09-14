@@ -12,8 +12,68 @@ struct MarkdownFormatCommand: Equatable {
     let style: MarkdownFormatStyle
 }
 
+enum MarkdownStorageCodec {
+    static func source(from storage: NSAttributedString) -> String {
+        let ns = storage.string as NSString
+        var output = ""
+        var display = 0
+        while display < storage.length {
+            var effective = NSRange(location: display, length: 0)
+            if let attachment = storage.attribute(.attachment, at: display,
+                                                  effectiveRange: &effective) as? MarkdownImageAttachment {
+                output += attachment.markdownSource
+            } else {
+                output += ns.substring(with: effective)
+            }
+            display = NSMaxRange(effective)
+        }
+        return output
+    }
+
+    static func sourceOffset(forDisplayOffset offset: Int, in storage: NSAttributedString) -> Int {
+        var source = 0
+        var display = 0
+        let target = min(max(0, offset), storage.length)
+        while display < target {
+            var effective = NSRange(location: display, length: 0)
+            if let attachment = storage.attribute(.attachment, at: display,
+                                                  effectiveRange: &effective) as? MarkdownImageAttachment {
+                source += (attachment.markdownSource as NSString).length
+                display = min(NSMaxRange(effective), target)
+            } else {
+                let consumed = min(effective.length, target - display)
+                source += consumed
+                display += consumed
+            }
+        }
+        return source
+    }
+
+    static func displayOffset(forSourceOffset offset: Int, in storage: NSAttributedString) -> Int {
+        var source = 0
+        var display = 0
+        let target = max(0, offset)
+        while display < storage.length && source < target {
+            var effective = NSRange(location: display, length: 0)
+            if let attachment = storage.attribute(.attachment, at: display,
+                                                  effectiveRange: &effective) as? MarkdownImageAttachment {
+                let sourceLength = (attachment.markdownSource as NSString).length
+                if source + sourceLength > target { return display }
+                source += sourceLength
+                display = NSMaxRange(effective)
+            } else {
+                let consumed = min(effective.length, target - source)
+                source += consumed
+                display += consumed
+            }
+        }
+        return display
+    }
+}
+
 struct LiveMarkdownEditor: NSViewRepresentable {
     @Binding var text: String
+    let documentID: String?
     let baseURL: URL?
     let onPasteImage: (NSImage) -> String?
     let formatCommand: MarkdownFormatCommand?
@@ -52,17 +112,24 @@ struct LiveMarkdownEditor: NSViewRepresentable {
 
         context.coordinator.editor = editor
         context.coordinator.render(text, baseURL: baseURL, preservingSelection: false)
+        context.coordinator.lastDocumentID = documentID
         return scroll
     }
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         context.coordinator.parent = self
+        let documentChanged = context.coordinator.lastDocumentID != documentID
         if let command = formatCommand, command.id != context.coordinator.lastFormatCommandID {
             context.coordinator.lastFormatCommandID = command.id
             (scroll.documentView as? MarkdownTextView)?.applyFormat(command.style)
         }
-        guard context.coordinator.lastSource != text || context.coordinator.lastBaseURL != baseURL else { return }
-        context.coordinator.render(text, baseURL: baseURL, preservingSelection: true)
+        guard documentChanged || context.coordinator.lastSource != text || context.coordinator.lastBaseURL != baseURL else { return }
+        context.coordinator.render(text, baseURL: baseURL, preservingSelection: !documentChanged)
+        context.coordinator.lastDocumentID = documentID
+        if documentChanged {
+            scroll.contentView.scroll(to: .zero)
+            scroll.reflectScrolledClipView(scroll.contentView)
+        }
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
@@ -71,14 +138,16 @@ struct LiveMarkdownEditor: NSViewRepresentable {
         var isRendering = false
         var lastSource = ""
         var lastBaseURL: URL?
-        var selectionRenderTask: Task<Void, Never>?
+        var lastDocumentID: String?
         var lastFormatCommandID: UUID?
+        var pendingEditedRange: NSRange?
+        var imageCache: [String: NSImage] = [:]
 
         init(_ parent: LiveMarkdownEditor) { self.parent = parent }
 
         func textDidChange(_ notification: Notification) {
             guard !isRendering, let editor else { return }
-            selectionRenderTask?.cancel()
+            guard !editor.hasMarkedText() else { return }
             let storage = editor.textStorage ?? NSTextStorage()
             let source = markdownSource(from: storage)
             let displaySelection = editor.selectedRange()
@@ -90,26 +159,28 @@ struct LiveMarkdownEditor: NSViewRepresentable {
             render(source, baseURL: parent.baseURL, preservingSelection: false, sourceSelection: sourceSelection)
         }
 
+        func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange,
+                      replacementString: String?) -> Bool {
+            pendingEditedRange = NSRange(location: affectedCharRange.location,
+                                         length: (replacementString as NSString?)?.length ?? 0)
+            return true
+        }
+
         func textViewDidChangeSelection(_ notification: Notification) {
             guard !isRendering, let editor, editor.window?.firstResponder === editor else { return }
             let formats = (editor as? MarkdownTextView)?.currentFormats() ?? []
             Task { @MainActor [weak self] in self?.parent.onSelectionFormatsChanged(formats) }
-            guard editor.selectedRange().length == 0 else { return }
-            let storage = editor.textStorage ?? NSTextStorage()
-            let source = markdownSource(from: storage)
-            let cursor = sourceOffset(forDisplayOffset: editor.selectedRange().location, in: storage)
-            let baseURL = parent.baseURL
-            selectionRenderTask?.cancel()
-            selectionRenderTask = Task { @MainActor [weak self] in
-                await Task.yield()
-                guard !Task.isCancelled, let self else { return }
-                self.render(source, baseURL: baseURL, preservingSelection: false,
-                            sourceSelection: NSRange(location: cursor, length: 0))
-            }
         }
 
         func render(_ source: String, baseURL: URL?, preservingSelection: Bool, sourceSelection suppliedSelection: NSRange? = nil) {
             guard let editor else { return }
+            let shouldPreserveViewport = preservingSelection || suppliedSelection != nil
+            let clipView = shouldPreserveViewport ? editor.enclosingScrollView?.contentView : nil
+            let visibleOrigin = clipView?.bounds.origin
+            let caretViewportY = clipView.flatMap { clip in
+                caretDocumentY(in: editor, at: editor.selectedRange().location).map { $0 - clip.bounds.origin.y }
+            }
+            let selectionAffinity = editor.selectionAffinity
             let sourceSelection: NSRange
             if let suppliedSelection {
                 sourceSelection = suppliedSelection
@@ -125,14 +196,86 @@ struct LiveMarkdownEditor: NSViewRepresentable {
 
             isRendering = true
             let rendered = makeAttributedMarkdown(source, baseURL: baseURL, cursor: sourceSelection.location)
-            editor.textStorage?.setAttributedString(rendered)
+            applyRenderedText(rendered, to: editor)
             let displayStart = displayOffset(forSourceOffset: sourceSelection.location, in: rendered)
             let displayEnd = displayOffset(forSourceOffset: NSMaxRange(sourceSelection), in: rendered)
-            editor.setSelectedRange(NSRange(location: min(displayStart, rendered.length),
-                                            length: max(0, min(displayEnd, rendered.length) - min(displayStart, rendered.length))))
+            editor.setSelectedRange(
+                NSRange(location: min(displayStart, rendered.length),
+                        length: max(0, min(displayEnd, rendered.length) - min(displayStart, rendered.length))),
+                affinity: selectionAffinity,
+                stillSelecting: false
+            )
+            restoreViewport(origin: visibleOrigin, caretViewportY: caretViewportY,
+                            in: clipView, editor: editor)
             isRendering = false
+            pendingEditedRange = nil
             lastSource = source
             lastBaseURL = baseURL
+        }
+
+        private func applyRenderedText(_ rendered: NSAttributedString, to editor: NSTextView) {
+            guard let storage = editor.textStorage else { return }
+            guard storage.length == rendered.length, storage.string == rendered.string else {
+                storage.setAttributedString(rendered)
+                return
+            }
+
+            let range: NSRange
+            if let pendingEditedRange {
+                let safeLocation = min(pendingEditedRange.location, rendered.length)
+                let safeLength = min(pendingEditedRange.length, rendered.length - safeLocation)
+                range = (rendered.string as NSString).lineRange(
+                    for: NSRange(location: safeLocation, length: safeLength)
+                )
+            } else {
+                range = NSRange(location: 0, length: rendered.length)
+            }
+            guard range.length > 0 else { return }
+
+            storage.beginEditing()
+            storage.setAttributes([:], range: range)
+            rendered.enumerateAttributes(in: range) { attributes, effectiveRange, _ in
+                storage.setAttributes(attributes, range: effectiveRange)
+            }
+            storage.endEditing()
+        }
+
+        private func restoreViewport(origin: NSPoint?, caretViewportY: CGFloat?,
+                                     in clipView: NSClipView?, editor: NSTextView) {
+            guard let origin, let clipView else { return }
+
+            // Replacing the complete attributed string invalidates layout. Force that
+            // layout now, then put the clip view back where the native edit left it.
+            // This prevents selection restoration from scrolling the document again.
+            if let textContainer = editor.textContainer {
+                editor.layoutManager?.ensureLayout(for: textContainer)
+            }
+            editor.layoutSubtreeIfNeeded()
+            var bounds = clipView.bounds
+            bounds.origin = origin
+            if let caretViewportY,
+               let newCaretY = caretDocumentY(in: editor, at: editor.selectedRange().location) {
+                bounds.origin.y = newCaretY - caretViewportY
+            }
+            let constrained = clipView.constrainBoundsRect(bounds)
+            clipView.scroll(to: constrained.origin)
+            editor.enclosingScrollView?.reflectScrolledClipView(clipView)
+        }
+
+        private func caretDocumentY(in editor: NSTextView, at location: Int) -> CGFloat? {
+            guard let storage = editor.textStorage,
+                  let layoutManager = editor.layoutManager,
+                  editor.textContainer != nil else { return nil }
+            guard storage.length > 0 else { return editor.textContainerOrigin.y }
+            let character = min(max(0, location), storage.length - 1)
+            layoutManager.ensureLayout(forCharacterRange: NSRange(location: character, length: 1))
+            if location >= storage.length,
+               layoutManager.extraLineFragmentTextContainer != nil {
+                return editor.textContainerOrigin.y + layoutManager.extraLineFragmentRect.minY
+            }
+            let glyph = layoutManager.glyphIndexForCharacter(at: character)
+            let line = layoutManager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+            return editor.textContainerOrigin.y + line.minY
         }
 
         private func makeAttributedMarkdown(_ source: String, baseURL: URL?, cursor: Int) -> NSMutableAttributedString {
@@ -330,15 +473,11 @@ struct LiveMarkdownEditor: NSViewRepresentable {
 
         private func styleMarker(in text: NSMutableAttributedString, marker: NSRange, activeRange: NSRange, cursor: Int) {
             guard marker.length > 0 else { return }
-            let isActive = cursor >= activeRange.location && cursor <= NSMaxRange(activeRange)
-            if isActive {
-                text.addAttributes([.font: NSFont.systemFont(ofSize: 13, weight: .medium),
-                                    .foregroundColor: NSColor.tertiaryLabelColor], range: marker)
-            } else {
-                text.addAttributes([.font: NSFont.systemFont(ofSize: 0.1),
-                                    .foregroundColor: NSColor.clear,
-                                    .kern: -0.1], range: marker)
-            }
+            // Keep delimiter metrics independent from the caret. Expanding hidden
+            // markers around it reflows wrapped lines and makes selections jump.
+            text.addAttributes([.font: NSFont.systemFont(ofSize: 0.1),
+                                .foregroundColor: NSColor.clear,
+                                .kern: -0.1], range: marker)
         }
 
         private func styleLinks(in text: NSMutableAttributedString, cursor: Int) {
@@ -349,12 +488,6 @@ struct LiveMarkdownEditor: NSViewRepresentable {
                 let label = match.range(at: 1)
                 text.addAttributes([.foregroundColor: NSColor.linkColor,
                                     .underlineStyle: NSUnderlineStyle.single.rawValue], range: label)
-                guard !(cursor >= whole.location && cursor <= NSMaxRange(whole)) else {
-                    text.addAttribute(.foregroundColor, value: NSColor.tertiaryLabelColor, range: whole)
-                    text.addAttributes([.foregroundColor: NSColor.linkColor,
-                                        .underlineStyle: NSUnderlineStyle.single.rawValue], range: label)
-                    continue
-                }
                 let opening = NSRange(location: whole.location, length: label.location - whole.location)
                 let tail = NSRange(location: NSMaxRange(label), length: NSMaxRange(whole) - NSMaxRange(label))
                 styleMarker(in: text, marker: opening, activeRange: NSRange(location: NSMaxRange(whole) + 1, length: 0), cursor: cursor)
@@ -370,18 +503,45 @@ struct LiveMarkdownEditor: NSViewRepresentable {
                 let ns = text.string as NSString
                 let alt = ns.substring(with: match.range(at: 1))
                 let encodedPath = ns.substring(with: match.range(at: 2))
-                guard let path = encodedPath.removingPercentEncoding,
-                      let image = NSImage(contentsOf: baseURL.appendingPathComponent(path)) else { continue }
-                let markdown = ns.substring(with: match.range(at: 0))
-                let attachment = MarkdownImageAttachment(markdownSource: markdown, image: scaled(image))
-                let replacement = NSMutableAttributedString(attachment: attachment)
-                if !alt.isEmpty {
-                    replacement.append(NSAttributedString(string: "  \(alt)", attributes: [
-                        .font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.secondaryLabelColor
-                    ]))
+                guard let path = encodedPath.removingPercentEncoding else { continue }
+                let imageURL = baseURL.appendingPathComponent(path)
+                let values = try? imageURL.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+                let cacheKey = "\(imageURL.standardizedFileURL.path)|\(values?.contentModificationDate?.timeIntervalSince1970 ?? 0)|\(values?.fileSize ?? 0)|\(alt)"
+                let image: NSImage
+                if let cached = imageCache[cacheKey] {
+                    image = cached
+                } else {
+                    guard let loaded = NSImage(contentsOf: imageURL) else { continue }
+                    let scaledImage = scaled(loaded)
+                    image = alt.isEmpty ? scaledImage : imageWithCaption(scaledImage, caption: alt)
+                    imageCache[cacheKey] = image
                 }
+                let markdown = ns.substring(with: match.range(at: 0))
+                let attachment = MarkdownImageAttachment(markdownSource: markdown, image: image)
+                let replacement = NSMutableAttributedString(attachment: attachment)
                 text.replaceCharacters(in: match.range(at: 0), with: replacement)
             }
+        }
+
+        private func imageWithCaption(_ image: NSImage, caption: String) -> NSImage {
+            let captionHeight: CGFloat = 24
+            let output = NSImage(size: NSSize(width: image.size.width,
+                                              height: image.size.height + captionHeight))
+            output.lockFocus()
+            image.draw(in: NSRect(x: 0, y: captionHeight,
+                                  width: image.size.width, height: image.size.height))
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.alignment = .center
+            (caption as NSString).draw(
+                in: NSRect(x: 0, y: 4, width: image.size.width, height: captionHeight - 4),
+                withAttributes: [
+                    .font: NSFont.systemFont(ofSize: 12),
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                    .paragraphStyle: paragraph
+                ]
+            )
+            output.unlockFocus()
+            return output
         }
 
         private func scaled(_ image: NSImage) -> NSImage {
@@ -396,48 +556,40 @@ struct LiveMarkdownEditor: NSViewRepresentable {
         }
 
         private func markdownSource(from storage: NSTextStorage) -> String {
-            let ns = storage.string as NSString
-            var output = ""
-            var index = 0
-            while index < storage.length {
-                if let attachment = storage.attribute(.attachment, at: index, effectiveRange: nil) as? MarkdownImageAttachment {
-                    output += attachment.markdownSource
-                } else {
-                    output += ns.substring(with: NSRange(location: index, length: 1))
-                }
-                index += 1
-            }
-            return output
+            MarkdownStorageCodec.source(from: storage)
         }
 
         private func sourceOffset(forDisplayOffset offset: Int, in storage: NSTextStorage) -> Int {
-            var source = 0
-            var display = 0
-            while display < min(offset, storage.length) {
-                if let attachment = storage.attribute(.attachment, at: display, effectiveRange: nil) as? MarkdownImageAttachment {
-                    source += (attachment.markdownSource as NSString).length
-                } else { source += 1 }
-                display += 1
-            }
-            return source
+            MarkdownStorageCodec.sourceOffset(forDisplayOffset: offset, in: storage)
         }
 
         private func displayOffset(forSourceOffset offset: Int, in storage: NSAttributedString) -> Int {
-            var source = 0
-            var display = 0
-            while display < storage.length && source < offset {
-                if let attachment = storage.attribute(.attachment, at: display, effectiveRange: nil) as? MarkdownImageAttachment {
-                    source += (attachment.markdownSource as NSString).length
-                } else { source += 1 }
-                display += 1
-            }
-            return display
+            MarkdownStorageCodec.displayOffset(forSourceOffset: offset, in: storage)
         }
     }
 }
 
 private final class MarkdownTextView: NSTextView {
     var imagePasteHandler: ((NSImage) -> String?)?
+
+    override func insertText(_ insertString: Any, replacementRange: NSRange) {
+        let range = replacementRange.location == NSNotFound ? selectedRange() : replacementRange
+        guard range.length > 0,
+              let delimiter = insertString as? String,
+              ["*", "_", "~", "=", "`"].contains(delimiter) else {
+            super.insertText(insertString, replacementRange: replacementRange)
+            return
+        }
+        guard !containsAttachment(in: range) else {
+            NSSound.beep()
+            return
+        }
+
+        let selected = (string as NSString).substring(with: range)
+        super.insertText(delimiter + selected + delimiter, replacementRange: range)
+        setSelectedRange(NSRange(location: range.location + (delimiter as NSString).length,
+                                 length: (selected as NSString).length))
+    }
 
     override func paste(_ sender: Any?) {
         let pasteboard = NSPasteboard.general
@@ -619,6 +771,10 @@ private final class MarkdownTextView: NSTextView {
 
     private func toggleInline(opening: String, closing: String) {
         let selection = selectedRange()
+        guard !containsAttachment(in: selection) else {
+            NSSound.beep()
+            return
+        }
         let source = string as NSString
         let openingLength = (opening as NSString).length
         let closingLength = (closing as NSString).length
@@ -672,6 +828,10 @@ private final class MarkdownTextView: NSTextView {
         let source = string as NSString
         let selection = selectedRange()
         let lineRange = source.lineRange(for: selection)
+        guard !containsAttachment(in: lineRange) else {
+            NSSound.beep()
+            return
+        }
         let original = source.substring(with: lineRange)
         let endsWithNewline = original.hasSuffix("\n")
         var lines = original.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
@@ -693,6 +853,10 @@ private final class MarkdownTextView: NSTextView {
             ? NSRange(location: selection.location, length: max(0, selection.length - 1))
             : selection
         let lineRange = source.lineRange(for: lookupRange)
+        guard !containsAttachment(in: lineRange) else {
+            NSSound.beep()
+            return
+        }
         let original = source.substring(with: lineRange)
         let endsWithNewline = original.hasSuffix("\n")
         var lines = original.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
@@ -727,6 +891,10 @@ private final class MarkdownTextView: NSTextView {
             ? NSRange(location: selection.location, length: max(0, selection.length - 1))
             : selection
         let lineRange = source.lineRange(for: lookupRange)
+        guard !containsAttachment(in: lineRange) else {
+            NSSound.beep()
+            return
+        }
         let original = source.substring(with: lineRange)
         let endsWithNewline = original.hasSuffix("\n")
         var lines = original.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
@@ -750,6 +918,10 @@ private final class MarkdownTextView: NSTextView {
 
     private func insertLink() {
         let selection = selectedRange()
+        guard !containsAttachment(in: selection) else {
+            NSSound.beep()
+            return
+        }
         let label = selection.length > 0 ? (string as NSString).substring(with: selection) : "texto"
         let replacement = "[\(label)](https://)"
         insertText(replacement, replacementRange: selection)
@@ -773,9 +945,29 @@ private final class MarkdownTextView: NSTextView {
 
     @objc private func insertDivider(_ sender: Any?) {
         let selection = selectedRange()
+        guard !containsAttachment(in: selection) else {
+            NSSound.beep()
+            return
+        }
         let prefix = selection.location > 0 && !(string as NSString).substring(with: NSRange(location: selection.location - 1, length: 1)).contains("\n") ? "\n" : ""
         let divider = prefix + "\n---\n\n"
         insertText(divider, replacementRange: selection)
+    }
+
+    private func containsAttachment(in range: NSRange) -> Bool {
+        guard range.length > 0, let storage = textStorage, storage.length > 0 else { return false }
+        let safeLocation = min(range.location, storage.length)
+        let safeLength = min(range.length, storage.length - safeLocation)
+        guard safeLength > 0 else { return false }
+        var found = false
+        storage.enumerateAttribute(.attachment,
+                                   in: NSRange(location: safeLocation, length: safeLength)) { value, _, stop in
+            if value != nil {
+                found = true
+                stop.pointee = true
+            }
+        }
+        return found
     }
 
     private func imageFromCopiedFile(in pasteboard: NSPasteboard) -> NSImage? {
@@ -786,7 +978,7 @@ private final class MarkdownTextView: NSTextView {
     }
 }
 
-private final class MarkdownImageAttachment: NSTextAttachment {
+final class MarkdownImageAttachment: NSTextAttachment {
     let markdownSource: String
 
     init(markdownSource: String, image: NSImage) {

@@ -59,6 +59,10 @@ enum LibraryFilter: String, CaseIterable, Identifiable {
     }
 }
 
+enum CourseProgressState {
+    case unstarted, inProgress, completed
+}
+
 enum NoteSaveState: Equatable {
     case idle, saving, saved, failed
 
